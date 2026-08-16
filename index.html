@@ -620,7 +620,7 @@ document.getElementById('main').addEventListener('click',e=>{
   const b=e.target.closest('.book');   if(b) openBook(b.dataset.isbn);
 });
 const sheet=document.getElementById('sheet'), card=document.getElementById('card');
-const closeSheet=()=>sheet.classList.remove('on');
+const closeSheet=()=>{ hid.on=false; sheet.classList.remove('on'); };
 const openWith=h=>{ card.innerHTML=h; sheet.classList.add('on'); card.scrollTop=0; };
 sheet.addEventListener('click',e=>{ if(e.target===sheet) closeSheet(); });
 
@@ -929,8 +929,65 @@ let stream=null, loop=null, busy=false;
 const isSecure=()=>location.protocol==='https:'||['localhost','127.0.0.1'].includes(location.hostname);
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
+/* ══ 連続スキャン（USBバーコードリーダー） ══
+   USBのリーダーはほぼ全てHIDキーボードとして振る舞い、読んだ数字を高速に
+   打ち込んで最後にEnterを送る。カメラも BarcodeDetector も要らないので、
+   カメラが使えない端末はこちらに回す。
+   人の打鍵と区別するため、キーの間隔が短い数字の並びだけを拾う。 */
+const HID_GAP=120;                       // これより間が空いたら人の入力とみなして捨てる
+let hid={buf:'',t:0,on:false,n:0};
+document.addEventListener('keydown',e=>{
+  if(!hid.on) return;
+  const tag=(e.target&&e.target.tagName)||'';
+  if(tag==='INPUT'||tag==='TEXTAREA') return;      // 手入力の邪魔をしない
+  const now=Date.now();
+  if(now-hid.t>HID_GAP) hid.buf='';
+  hid.t=now;
+  if(/^[0-9]$/.test(e.key)){ hid.buf+=e.key; return; }
+  if(e.key!=='Enter') return;
+  const code=hid.buf; hid.buf='';
+  if(code) hidAdd(code);
+});
+
+async function hidAdd(code){
+  const log=document.getElementById('ulog'); if(!log) return;
+  const row=(text,color)=>{
+    if(log.querySelector('.meta')) log.innerHTML='<div class="rows"></div>';
+    const box=log.querySelector('.rows')||log;
+    const d=document.createElement('div'); d.className='r';
+    const a=document.createElement('span'); a.textContent=text;   // textContent なので何が来ても安全
+    const b=document.createElement('span'); b.textContent=color==='ok'?'追加':'—';
+    b.style.color=color==='ok'?'var(--jade)':'var(--alert)';
+    d.append(a,b); box.prepend(d);
+    document.getElementById('ucount').textContent=hid.n+'冊';
+  };
+  if(!isISBN13(code)){ row(`ISBN として正しくありません（${code}）`,'ng'); return; }
+  if(books.some(b=>b.isbn===code)){ row('もう棚にあります','ng'); return; }
+  const b=await add(code,{own:addOwn,quiet:true});
+  if(b){ hid.n++; row(b.title,'ok'); } else row(`見つかりませんでした（${code}）`,'ng');
+}
+
+function openScanUSB(){
+  hid={buf:'',t:0,on:true,n:0};
+  openWith(`
+    <h2>連続スキャン</h2>
+    <p class="meta">USBバーコードリーダーで、裏表紙の <b>978</b> で始まる方を続けて読ませてください。
+      画面はこのままで大丈夫です。入力欄を選ぶ必要はありません。</p>
+    <div class="lab">追加するときの持ちかた</div>
+    <div class="seg" id="uo">${OWNS.map(o=>
+      `<button data-v="${o.id}" class="${addOwn===o.id?'on':''}">${o.label}</button>`).join('')}</div>
+    <div class="lab">読み取り<span style="float:right" id="ucount">0冊</span></div>
+    <div id="ulog"><p class="meta" style="padding:10px 0">待っています…</p></div>`);
+  document.getElementById('uo').onclick=e=>{
+    const t=e.target.closest('[data-v]'); if(!t) return;
+    addOwn=t.dataset.v;
+    [...document.getElementById('uo').children].forEach(x=>x.classList.toggle('on',x===t));
+  };
+}
+
 document.getElementById('scan').onclick=async()=>{
-  if(!('BarcodeDetector' in window)){ toast('この端末では読み取れません。「探す」をどうぞ',true); return; }
+  // カメラが使えない端末（Windows の Chrome など）はUSBリーダー用の画面へ回す
+  if(!('BarcodeDetector' in window)){ openScanUSB(); return; }
   if(!isSecure()){ toast('カメラは https か localhost でのみ使えます',true); return; }
   const video=document.getElementById('video');
   try{
@@ -1001,11 +1058,13 @@ document.getElementById('more').onclick=()=>{
       ${top.map(([a,c])=>`<div class="r"><span>${esc(a)}</span><span>${c}冊</span></div>`).join('')}
     </div>
     <div class="menu" style="margin-top:16px">
+      <button id="usb">連続スキャン（USBリーダー）</button>
       <button id="ejson">JSON で書き出す</button>
       <button id="ecsv">CSV で書き出す</button>
       <button id="imp">JSON を読み込む</button>
       <button id="net">通信を確かめる</button>
     </div>`);
+  document.getElementById('usb').onclick=()=>openScanUSB();
   document.getElementById('net').onclick=()=>{
     const box=document.getElementById('card');
     diagnose(box).then(()=>wire(box,[],''));
@@ -1035,7 +1094,9 @@ function dl(text,ext,mime){
   const url=URL.createObjectURL(new Blob([text],{type:mime}));
   const a=document.createElement('a');
   a.href=url; a.download=`bookshelf-${new Date().toISOString().slice(0,10)}.${ext}`;
-  a.click(); URL.revokeObjectURL(url);
+  a.click();
+  // すぐ revoke すると保存が始まる前にURLが消えることがある（特にスマホ）
+  setTimeout(()=>URL.revokeObjectURL(url),10000);
 }
 
 /* ══ 起動（v1 / v2 のデータも引き継ぐ） ══ */
