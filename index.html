@@ -90,6 +90,7 @@ main{padding:14px 16px 130px}
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .ssub{font-size:11.5px;color:var(--dim);margin-top:2px;font-variant-numeric:tabular-nums}
 .ssub .miss{color:var(--alert);font-weight:700}
+.ssub .fin{color:var(--jade);font-weight:700}
 
 /* ══ 単巻グリッド ══ */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:15px 11px;align-items:end}
@@ -536,12 +537,33 @@ async function add(isbn,opts){
 /* ══════════════════════════════════════════════════════════════
    棚の組み立て。「買うべき巻」＝ 未登録の穴 ＋ 未所持で登録した巻
    ══════════════════════════════════════════════════════════════ */
+/* 束ねる鍵は「題名＋著者」。題名だけで束ねると、同じ題名の小説版と漫画版が
+   1つに潰れ、巻が重なったほうが棚から見えなくなる（オーバーロードは
+   小説19巻と漫画8巻が同じ見出しで、漫画の1〜8巻が触れなくなっていた）。
+   著者は「丸山くがね／著」「丸山くがね、so-bin」のような揺れがあるので、
+   先頭の1人だけを取り、肩書きを落として比べる。 */
+const akey=s=>skey(String(s||'').split(/[、,\/／]/)[0]
+  .replace(/\s*[／\/]?\s*(著|作|画|原作|イラスト|漫画)\s*$/,''));
+
 function build(list){
   const m=new Map();
   list.forEach(b=>{
-    const k=b.series?('S'+skey(b.series)):('\u0000'+b.isbn);
-    if(!m.has(k)) m.set(k,{key:k,series:b.series,items:[]});
+    const k=b.series?('S'+skey(b.series)+'|'+akey(b.author)):('B'+b.isbn);
+    if(!m.has(k)) m.set(k,{key:k,series:b.series,author:b.author||'',items:[]});
     m.get(k).items.push(b);
+  });
+  /* 著者が空の本（手入力など）は、同じ題名の束が1つだけならそこへ寄せる。
+     2つ以上あるとどちらの版か決められないので、そのまま独立させる。 */
+  const byTitle=new Map();
+  m.forEach(g=>{ if(!g.series) return;
+    const t=skey(g.series);
+    if(!byTitle.has(t)) byTitle.set(t,[]);
+    byTitle.get(t).push(g); });
+  byTitle.forEach(groups=>{
+    const named=groups.filter(g=>akey(g.author));
+    const blank=groups.filter(g=>!akey(g.author));
+    if(named.length!==1||!blank.length) return;
+    blank.forEach(g=>{ named[0].items.push(...g.items); m.delete(g.key); });
   });
   const gs=[...m.values()];
   gs.forEach(g=>{
@@ -559,6 +581,10 @@ function build(list){
     g.newest=Math.max(...g.items.map(x=>x.added||0));
     g.isSeries=!!g.series&&g.max>0;
   });
+  // 同じ題名の束が2つ以上あるときだけ、札に著者を添えて見分けられるようにする
+  const cnt={};
+  gs.forEach(g=>{ if(g.series){ const t=skey(g.series); cnt[t]=(cnt[t]||0)+1; } });
+  gs.forEach(g=>{ g.dup=!!(g.series&&cnt[skey(g.series)]>1&&g.author); });
   return gs.sort((a,b)=>b.newest-a.newest);
 }
 
@@ -647,7 +673,8 @@ function render(){
         <div class="mini">${jacketImg(head,50,75)}</div>
         <div class="sbody">
           <div class="stitle">${esc(g.series)}</div>
-          <div class="ssub">所持${g.have} / 最新${g.max}巻${
+          <div class="ssub">${g.dup?esc(g.author.split(/[、,\/／]/)[0])+' · ':''}所持${g.have} / 最新${g.max}巻${
+            isDone(g)?' · <span class="fin">完結</span>':''}${
             g.buy.length?` · <span class="miss">未所持 ${g.buy.join('、')}</span>`:''}</div>
           <div class="strip">${strip}</div>
         </div></button>`;
@@ -885,8 +912,21 @@ function openSeries(key){
       `<button data-v="${s.id}">${s.label}</button>`).join('')}</div>
     <div class="seg" id="bown" style="margin-top:6px">${OWNS.map(o=>
       `<button data-v="${o.id}">${o.label}にする</button>`).join('')}</div>
+    <div class="lab">シリーズ全体</div>
+    <div class="menu">
+      <button id="fill">最新巻まで埋める（見つかった全巻を入れる）</button>
+      <button id="done"${isDone(g)?' class="on"':''}>${isDone(g)?'完結にしている':'完結にする'}</button>
+    </div>
     <div id="found"></div>
     <div class="acts"><button class="save" id="hunt">${wants.join('、')}巻を探す</button></div>`);
+  document.getElementById('fill').onclick=()=>fillSeries(g,addOwn);
+  document.getElementById('done').onclick=e=>{
+    const on=toggleDone(g);
+    e.currentTarget.classList.toggle('on',on);
+    e.currentTarget.textContent=on?'完結にしている':'完結にする';
+    render();
+    toast(on?'完結にしました。新刊の確認から外します':'完結を外しました');
+  };
   card.querySelectorAll('[data-o]').forEach(el=>el.onclick=()=>openBook(el.dataset.o));
   card.querySelectorAll('[data-w]').forEach(el=>el.onclick=()=>hunt(g,[+el.dataset.w]));
   document.getElementById('hunt').onclick=()=>hunt(g,wants);
@@ -1014,6 +1054,52 @@ function bulkBar(items){
     : '';
 }
 
+/* ══ 完結の印 ══
+   openBD の ONIX には「完結フラグ」の枠があるが、実データでは
+   よつばと!・オーバーロード・幼女戦記の70冊すべてで空だった。
+   完結かどうかは当てにできる情報源が無いので、推測せず本人に宣言してもらう。
+   印を付けた作品は「新刊を調べる」の対象から外し、札に「完結」と出す。 */
+const DONE='bookshelf:done';
+const doneSet=()=>{ try{ return new Set(JSON.parse(localStorage.getItem(DONE)||'[]')); }
+                    catch(e){ return new Set(); } };
+const gkey=g=>skey(g.series||'')+'|'+akey(g.author);
+const isDone=g=>doneSet().has(gkey(g));
+function toggleDone(g){
+  const s=doneSet(), k=gkey(g);
+  s.has(k)?s.delete(k):s.add(k);
+  try{ localStorage.setItem(DONE,JSON.stringify([...s])); }catch(e){}
+  return s.has(k);
+}
+
+/* 持っている巻が飛び飛びでも、国会図書館が知っている巻をまとめて埋める。
+   「完結まで持っている」作品を1タップで揃えるための入口。 */
+async function fillSeries(g,own){
+  const box=document.getElementById('found');
+  box.innerHTML='<p class="meta" style="padding:12px 0">全巻を調べています…</p>';
+  let all=[];
+  try{ all=await searchSeries(g.series); }catch(e){}
+  if(!all.length){
+    box.innerHTML=lastError
+      ? `<p class="meta" style="padding:12px 0;color:var(--alert)">${esc(errText(lastError))}。</p>`
+      : '<p class="meta" style="padding:12px 0">巻が見つかりませんでした。</p>';
+    return;
+  }
+  const want=all.filter(x=>!books.some(b=>b.isbn===x.isbn)
+    && akey(x.author)===akey(g.author));
+  if(!want.length){
+    box.innerHTML=`<p class="meta" style="padding:12px 0">すでに${all.length}巻すべて棚にあります。</p>`;
+    return;
+  }
+  let n=0;
+  for(const x of want){
+    box.innerHTML=`<p class="meta" style="padding:12px 0">入れています… ${n}/${want.length}</p>`;
+    if(await add(x.isbn,{own,quiet:true,rec:x})) n++;
+  }
+  render();
+  box.innerHTML=`<p class="meta" style="padding:12px 0;color:var(--jade)">`
+    +`${n}冊を${ownLabel(own)}で追加しました（全${all.length}巻）。</p>`;
+}
+
 /* ══ まとめて入力 ══
    既に持っている巻が分かりきっているとき、長い題名を巻の数だけ打つのは苦行。
    1行に1作品、題名のあとに範囲を書けば、その巻だけを棚に入れる。
@@ -1119,8 +1205,15 @@ async function runBulkInput(){
    抜け巻検出そのものが嘘になるため、押すたびに引き直す。 */
 async function checkNew(){
   const box=document.getElementById('card');
-  const gs=build(books).filter(g=>g.isSeries);
-  if(!gs.length){ box.innerHTML='<p class="meta" style="padding:12px 0">シリーズがまだありません。</p>'; return; }
+  const all=build(books).filter(g=>g.isSeries);
+  const gs=all.filter(g=>!isDone(g));          // 完結にした作品は追いかけない
+  const skipped=all.length-gs.length;
+  if(!gs.length){
+    box.innerHTML=`<p class="meta" style="padding:12px 0">`
+      +(all.length?`調べる作品がありません（${skipped}作品は完結にしています）。`
+                  :'シリーズがまだありません。')+'</p>';
+    return;
+  }
   const found=[]; let err=null;
   for(let i=0;i<gs.length;i++){
     const g=gs[i];
@@ -1135,7 +1228,9 @@ async function checkNew(){
   }
   if(!found.length){
     box.innerHTML=`<div class="lab">新刊</div><p class="meta" style="padding:12px 0">`
-      +(err?`調べきれませんでした。${errText(err)}。`:`${gs.length}作品を調べました。新しい巻は見つかりませんでした。`)
+      +(err?`調べきれませんでした。${errText(err)}。`
+           :`${gs.length}作品を調べました。新しい巻は見つかりませんでした。`
+            +(skipped?`（完結の${skipped}作品は除く）`:''))
       +`</p>`;
     return;
   }
