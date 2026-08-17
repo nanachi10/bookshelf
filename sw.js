@@ -7,7 +7,7 @@
    2. 書誌API（国会図書館・openBD）の応答は絶対にキャッシュしない。
       固定化すると新刊が出てこなくなり、抜け巻検出そのものが嘘になる。 */
 
-const V = 'bookshelf-v1';
+const V = 'bookshelf-v2';
 const SHELL = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 const NEVER = [/ndlsearch\.ndl\.go\.jp/, /api\.openbd\.jp/];        // 触らない
@@ -53,8 +53,11 @@ self.addEventListener('fetch', e => {
                  (url.origin === location.origin &&
                   (url.pathname.endsWith('/') || url.pathname.endsWith('index.html')));
   if (isPage) {
+    /* ネットワーク優先にするだけでは足りない。素の fetch はブラウザのHTTPキャッシュを
+       使うので、サーバ上のファイルを直しても古い版が返ってくることがある。
+       cache:'reload' で必ず取りに行かせる。ここを緩めると更新が届かなくなる。 */
     e.respondWith(
-      fetch(req)
+      fetch(req.url, { cache: 'reload', credentials: 'same-origin' })
         .then(res => put('./index.html', res))
         .catch(() => caches.match('./index.html').then(hit => hit || caches.match('./')))
     );

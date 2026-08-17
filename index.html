@@ -361,6 +361,13 @@ const errText=e=>{
 const NDL='https://ndlsearch.ndl.go.jp/api/opensearch';
 const textOf=(el,tag)=>{ const n=el.getElementsByTagName(tag)[0]; return n?n.textContent.trim():''; };
 
+/* 刊行日を YYYYMM に揃える。国会図書館は "2015.11" "2009.6" "[2019]" と形がまちまちで、
+   数字だけ抜くと "201511" と "20096" のように桁数が揃わず、刊行順に並べられなくなる。 */
+function ym(s){
+  const m=String(s||'').match(/(\d{4})(?:\s*[.\-\/年]\s*(\d{1,2}))?/);
+  if(!m) return '';
+  return m[1]+(m[2]?String(+m[2]).padStart(2,'0'):'');
+}
 // dcndl:volume は "3" のことも "上" のことも "3上" のこともある
 function volOf(s){
   const t=norm(s); if(!t) return null;
@@ -410,7 +417,7 @@ async function ndlQuery(p){
       // 「夏目, 漱石, 1867-1916」の形で来る。生没年は落として姓名だけ繋ぐ
       author:(textOf(it,'dc:creator')||'').replace(/,\s*\d{4}-(\d{4})?/g,'').replace(/,\s*/g,''),
       publisher:textOf(it,'dc:publisher'),
-      date:(textOf(it,'dcterms:issued')||textOf(it,'dc:date')).replace(/\D/g,''),
+      date:ym(textOf(it,'dcterms:issued')||textOf(it,'dc:date')),
       cover:'', src:'国会図書館', series:base, vol});
   });
   return out;
@@ -454,10 +461,26 @@ async function searchSeries(name){
   let out=[];
   try{ out=await ndlQuery({title:name,cnt:500}); }catch(e){ lastError=e; }
   if(out.length<3){ try{ out=out.concat(await ndlQuery({any:name,cnt:200})); }catch(e){ lastError=e; } }
-  const k=skey(name), vols=new Map();
-  out.map(x=>Object.assign({},x,seriesOf(x)))
-     .filter(x=>x.vol&&skey(x.series)===k)
-     .forEach(x=>{ if(!vols.has(x.vol)) vols.set(x.vol,x); });   // 同じ巻は最初のものを採る
+  const k=skey(name);
+  const mine=out.map(x=>Object.assign({},x,seriesOf(x)))
+                .filter(x=>x.vol&&skey(x.series)===k);
+  /* 同じ題名に小説版と漫画版が同居することがある。
+     「オーバーロード」は 丸山くがね＝小説19巻 と 深山フギン＝漫画8巻 が同じ見出し。
+     巻を最も多く持つ著者を本編とみなし、そちらを優先して採る。
+     これをしないと、巻ごとに版がまちまちに混ざる。 */
+  const byAuthor=new Map();
+  mine.forEach(x=>{ const a=skey(x.author||''); if(!a) return;
+    if(!byAuthor.has(a)) byAuthor.set(a,new Set());
+    byAuthor.get(a).add(x.vol); });
+  let main=null, best=0;
+  byAuthor.forEach((vols,a)=>{ if(vols.size>best){ best=vols.size; main=a; } });
+
+  const vols=new Map();
+  mine.forEach(x=>{
+    const cur=vols.get(x.vol);
+    if(!cur){ vols.set(x.vol,x); return; }
+    if(main && skey(x.author||'')===main && skey(cur.author||'')!==main) vols.set(x.vol,x);
+  });
   return [...vols.values()].sort((a,b)=>a.vol-b.vol);
 }
 
@@ -1200,6 +1223,7 @@ document.getElementById('more').onclick=()=>{
         if(!Array.isArray(data)) throw 0;
         const seen=new Set(books.map(b=>b.isbn));
         data.forEach(b=>{ if(b&&b.isbn&&!seen.has(b.isbn)){ books.push(normalize(b)); seen.add(b.isbn); } });
+        books=books.filter(b=>b.title);            // 題名まで無いものは棚に置けない
         books.sort((x,y)=>(y.added||0)-(x.added||0));
         await save(); render(); closeSheet(); toast('読み込みました');
       }catch(e){ toast('このファイルは読み込めません',true); }
@@ -1236,6 +1260,12 @@ function exportHint(){
 
 /* ══ 起動（v1 / v2 のデータも引き継ぐ） ══ */
 function normalize(b){
+  // 題名の無いレコードが混ざると、表紙や一覧の描画がそこで落ちる。
+  // 読み込んだファイルが手で編集されていることもあるので、ここで最低限を保証する
+  b.title=String(b.title==null?'':b.title);
+  b.author=String(b.author==null?'':b.author);
+  b.publisher=String(b.publisher==null?'':b.publisher);
+  b.date=String(b.date==null?'':b.date);
   if(!b.series&&!b.vol) Object.assign(b,parseSeries(b.title));
   if(!b.status) b.status=b.read?'read':'stock';
   delete b.read;
