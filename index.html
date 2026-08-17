@@ -35,8 +35,10 @@ header{position:sticky;top:0;z-index:20;background:var(--ink);
 h1{font-family:"Noto Serif JP",serif;font-weight:700;font-size:19px;
   letter-spacing:.22em;margin:0;color:var(--foil)}
 .stat{font-size:11.5px;letter-spacing:.08em;color:var(--dim);font-variant-numeric:tabular-nums}
+/* 指で押す前提なので、見た目の丸より広い当たり判定を持たせる（44px確保） */
 .sortbtn{margin-left:auto;font-size:11.5px;color:var(--dim);white-space:nowrap;
-  border:1px solid var(--ink-3);border-radius:999px;padding:2px 10px}
+  border:1px solid var(--ink-3);border-radius:999px;padding:6px 12px;min-height:44px;
+  display:inline-flex;align-items:center}
 .sortbtn:active{color:var(--paper)}
 .stat b{color:var(--alert);font-weight:700}
 .search{margin-top:9px;width:100%;background:var(--ink-2);border:1px solid var(--ink-3);
@@ -45,8 +47,9 @@ h1{font-family:"Noto Serif JP",serif;font-weight:700;font-size:19px;
 .search:focus{outline:2px solid var(--foil-dim);outline-offset:1px}
 .chips{display:flex;gap:6px;margin-top:9px;overflow-x:auto;scrollbar-width:none;padding-bottom:2px}
 .chips::-webkit-scrollbar{display:none}
-.chip{flex:0 0 auto;padding:5px 13px;border-radius:999px;font-size:12.5px;
-  border:1px solid var(--ink-3);color:var(--dim);white-space:nowrap}
+.chip{flex:0 0 auto;padding:10px 14px;border-radius:999px;font-size:12.5px;
+  border:1px solid var(--ink-3);color:var(--dim);white-space:nowrap;
+  min-height:44px;display:inline-flex;align-items:center}
 .chip.on{background:var(--foil);border-color:var(--foil);color:#1A1305;font-weight:700}
 
 main{padding:14px 16px 130px}
@@ -109,6 +112,9 @@ main{padding:14px 16px 130px}
 .rail{height:5px;margin-top:12px;border-radius:2px;
   background:linear-gradient(180deg,#4A3B2C,var(--shelf));box-shadow:0 3px 7px rgba(0,0,0,.5)}
 
+/* 圏外のときに「壊れた」と誤解されないよう、検索が使えない理由を先に示す */
+.offline{display:block;padding:8px 13px;margin-bottom:10px;border-radius:var(--r);
+  font-size:12px;color:var(--ink);background:var(--foil);font-weight:700}
 .hint{display:block;width:100%;padding:10px 13px;margin-bottom:12px;border-radius:var(--r);
   font-size:12.5px;line-height:1.5;color:var(--paper);
   background:var(--ink-2);border:1px solid var(--foil-dim)}
@@ -152,6 +158,13 @@ video{width:100%;height:100%;object-fit:cover}
 /* ══ シート ══ */
 .sheet{position:fixed;inset:0;z-index:60;display:none;align-items:flex-end;background:rgba(6,9,17,.76)}
 .sheet.on{display:flex}
+/* 詳細シートは画面の9割を覆うので、背景をタップして閉じる余白がほとんど残らない。
+   指の届く位置に閉じるボタンを重ねる */
+.sheetx{position:absolute;top:0;right:8px;width:48px;height:48px;
+  display:flex;align-items:center;justify-content:center;
+  font-size:26px;line-height:1;color:var(--paper);
+  background:rgba(20,28,46,.82);border-radius:50%;z-index:61;
+  margin-top:calc(env(safe-area-inset-top) + 8px)}
 .card{width:100%;background:var(--ink-2);border-radius:16px 16px 0 0;
   padding:20px 17px calc(22px + env(safe-area-inset-bottom));
   border-top:2px solid var(--foil-dim);animation:up .26s cubic-bezier(.2,.8,.3,1);
@@ -253,7 +266,8 @@ video{width:100%;height:100%;object-fit:cover}
   <button class="close" id="stop">閉じる</button>
 </div>
 
-<div class="sheet" id="sheet"><div class="card" id="card"></div></div>
+<div class="sheet" id="sheet"><div class="card" id="card"></div>
+  <button class="sheetx" id="sheetx" aria-label="閉じる">×</button></div>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -613,7 +627,9 @@ function render(){
   }
 
   const series=applySort(gs.filter(g=>g.isSeries)), singles=applySort(gs.filter(g=>!g.isSeries));
-  let html=exportHint();
+  let html=(navigator.onLine===false
+    ? `<div class="offline">オフラインです。棚は見られますが、検索と新刊の確認はできません</div>` : '')
+    + exportHint();
 
   if(series.length){
     html+=`<div class="h">シリーズ ${series.length}</div>`;
@@ -722,6 +738,9 @@ function fbCover(el){
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 /* ══ 配線 ══ */
+// 圏外に出た／戻ったら、その場で表示を切り替える
+addEventListener('online',()=>render());
+addEventListener('offline',()=>render());
 document.getElementById('sortbtn').onclick=()=>{
   openWith(`<h2>並び替え</h2>
     <div class="menu">${SORTS.map(s=>
@@ -741,9 +760,29 @@ document.getElementById('main').addEventListener('click',e=>{
   const b=e.target.closest('.book');   if(b) openBook(b.dataset.isbn);
 });
 const sheet=document.getElementById('sheet'), card=document.getElementById('card');
-const closeSheet=()=>{ hid.on=false; sheet.classList.remove('on'); };
-const openWith=h=>{ card.innerHTML=h; sheet.classList.add('on'); card.scrollTop=0; };
+/* Android の戻るキーでシートを閉じる。
+   これが無いと、シートを開いた状態で戻ったときにアプリごと離脱してしまう。
+   ホーム画面から起動していると、そのまま閉じたのと同じことになる。
+   開くときに履歴を1つ積み、閉じるときに戻す。 */
+let sheetOpen=false;
+const openWith=h=>{
+  card.innerHTML=h; card.scrollTop=0;
+  if(sheetOpen) return;
+  sheetOpen=true; sheet.classList.add('on');
+  try{ history.pushState({sh:1},''); }catch(e){}
+};
+const closeSheet=fromPop=>{
+  if(!sheetOpen) return;
+  sheetOpen=false; hid.on=false; sheet.classList.remove('on');
+  // 戻るキー由来のときは、履歴はもう戻っているので二重に戻さない
+  if(!fromPop && history.state && history.state.sh) history.back();
+};
+window.addEventListener('popstate',()=>{
+  if(sheetOpen) return closeSheet(true);
+  if(document.getElementById('scanner').classList.contains('on')) stopScan(true);
+});
 sheet.addEventListener('click',e=>{ if(e.target===sheet) closeSheet(); });
+document.getElementById('sheetx').onclick=()=>closeSheet();
 
 /* ══ 1冊の詳細（表紙つき） ══ */
 function openBook(isbn){
@@ -1194,6 +1233,7 @@ document.getElementById('scan').onclick=async()=>{
   video.srcObject=stream; await video.play();
   document.getElementById('scanner').classList.add('on');
   document.getElementById('log').innerHTML='';
+  try{ history.pushState({sc:1},''); }catch(e){}   // 戻るキーで閉じられるようにする
 
   const det=new BarcodeDetector({formats:['ean_13']});
   loop=setInterval(async()=>{
@@ -1227,12 +1267,15 @@ function pushLog(t){
   const d=document.createElement('div'); d.textContent=t; box.appendChild(d);
   while(box.children.length>3) box.removeChild(box.firstChild);
 }
-document.getElementById('stop').onclick=()=>{
+// カメラは必ず止める。止め忘れるとレンズが光ったままになり、電池も食う
+function stopScan(fromPop){
   clearInterval(loop); loop=null;
   if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
   document.getElementById('scanner').classList.remove('on');
   document.getElementById('hint').innerHTML='裏表紙の<b>上段</b>（978…）を枠に合わせてください';
-};
+  if(!fromPop && history.state && history.state.sc) history.back();
+}
+document.getElementById('stop').onclick=()=>stopScan();
 
 /* ══ メニュー ══ */
 document.getElementById('more').onclick=()=>{
