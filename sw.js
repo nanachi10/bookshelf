@@ -7,12 +7,13 @@
    2. 書誌API（国会図書館・openBD）の応答は絶対にキャッシュしない。
       固定化すると新刊が出てこなくなり、抜け巻検出そのものが嘘になる。 */
 
-const V = 'bookshelf-v2';
+const V = 'bookshelf-v3';
 const SHELL = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 const NEVER = [/ndlsearch\.ndl\.go\.jp/, /api\.openbd\.jp/];        // 触らない
-const KEEP  = [/images-na\.ssl-images-amazon\.com/,                 // 表紙は貯めてよい
-               /books\.google\.com/,
+const COVERS= [/images-na\.ssl-images-amazon\.com/,                 // 表紙は貯めてよい
+               /books\.google\.com/];
+const KEEP  = [...COVERS,
                /fonts\.googleapis\.com/, /fonts\.gstatic\.com/];
 
 self.addEventListener('install', e => {
@@ -32,11 +33,24 @@ self.addEventListener('activate', e => {
   );
 });
 
+/* 表紙キャッシュは放っておくと増える一方なので、古いものから間引く。
+   keys() は入れた順に返るため、先頭から消せばおおむね古い順になる */
+const LIMIT = 600;
+const trim = () => caches.open(V).then(async c => {
+  const ks = await c.keys();
+  const covers = ks.filter(r => COVERS.some(re => re.test(r.url)));
+  for (let i = 0; i < covers.length - LIMIT; i++) await c.delete(covers[i]);
+}).catch(() => {});
+
 const put = (req, res) => {
   // 不透明な応答（CORSなしの画像）は ok が false になるが、表示には使えるので残す
   if (res && (res.ok || res.type === 'opaque')) {
     const copy = res.clone();
-    caches.open(V).then(c => c.put(req, copy)).catch(() => {});
+    const url = typeof req === 'string' ? req : req.url;
+    caches.open(V)
+      .then(c => c.put(req, copy))
+      .then(() => { if (COVERS.some(re => re.test(url))) trim(); })
+      .catch(() => {});
   }
   return res;
 };
