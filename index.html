@@ -195,6 +195,8 @@ video{width:100%;height:100%;object-fit:cover}
 .field{margin-top:9px}
 .field input,.field textarea{width:100%;background:var(--ink);border:1px solid var(--ink-3);
   border-radius:8px;color:var(--paper);padding:9px 11px;font-size:13.5px;resize:vertical}
+.field select{background:var(--ink);border:1px solid var(--ink-3);border-radius:8px;
+  color:var(--paper);padding:9px 11px;font:inherit;font-size:13.5px;min-height:44px}
 .acts{display:flex;gap:8px;margin-top:18px}
 .acts button{flex:1;padding:12px;border-radius:var(--r);text-align:center;font-size:14px;background:var(--ink-3)}
 .acts .del{background:transparent;border:1px solid var(--alert);color:var(--alert);flex:0 0 32%}
@@ -434,23 +436,28 @@ function volOf(s){
   if(m){ const v=+m[0]; return (v>=1&&v<=200)?v:null; }
   return KAN[t[0]]||null;
 }
-/* 「オーバーロード = OVERLORD. 1」→「オーバーロード 1」。
-   原題の併記だけ落として巻数は拾い直す。「… : 第三章」は別作品なので触らない。 */
-const ndlTitle=s=>{
+/* 「オーバーロード = OVERLORD. 1」→ 見出し「オーバーロード 1」＋原題「OVERLORD」。
+   原題は捨てずに持っておく。英語の題で探す人はここに当たる。
+   「… : 第三章」は別作品なので触らない。 */
+function ndlSplit(s){
   const t=norm(s), i=t.indexOf('=');
-  if(i<0) return t;
-  const head=t.slice(0,i).trim(), tail=t.slice(i+1);
-  if(!head||!/^[A-Za-z0-9 .,:'’!?&-]+$/.test(tail)) return t;   // ラテン文字の併記だけを対象にする
+  if(i<0) return {base:t, alt:''};
+  const head=t.slice(0,i).trim(), tail=t.slice(i+1).trim();
+  if(!head||!/^[A-Za-z0-9 .,:'’!?&-]+$/.test(tail)) return {base:t, alt:''};   // ラテン文字の併記だけを対象にする
   const v=tail.match(/(\d{1,3})\s*$/);
-  return head+(v?' '+v[1]:'');
-};
+  return {base:head+(v?' '+v[1]:''),
+          alt:tail.replace(/[.,\s]*\d{1,3}\s*$/,'').trim()};
+}
+const ndlTitle=s=>ndlSplit(s).base;
 
 async function ndlQuery(p){
   const u=NDL+'?mediatype=books&cnt='+(p.cnt||200)+'&idx='+(p.idx||1)
     +(p.title?'&title='+encodeURIComponent(p.title):'')
     +(p.isbn ?'&isbn=' +encodeURIComponent(p.isbn) :'')
     +(p.any  ?'&any='  +encodeURIComponent(p.any)  :'');
-  const r=await fetch(u);
+  let r=await fetch(u);
+  // 混んでいて断られたら、少し待って一度だけ引き直す
+  if(r.status===429){ await sleep(1500); r=await fetch(u); }
   if(!r.ok) throw new Error('HTTP '+r.status);
   const doc=new DOMParser().parseFromString(await r.text(),'application/xml');
   if(doc.getElementsByTagName('parsererror').length) throw new Error('応答を読み取れませんでした');
@@ -460,19 +467,21 @@ async function ndlQuery(p){
      重複はシリーズを絞り込んだ後、呼び出し側で落とす。 */
   const out=[];
   Array.prototype.forEach.call(doc.getElementsByTagName('item'),it=>{
-    // 露・西・独語版などが混ざる。棚に入れたいのは日本で出た版だけ
+    // 露・西・独語版などが混ざる。棚に入れたいのは日本で出た版だけ。
+    // 値は "JP" のことも小文字 "ja" のこともある（実データで両方確認済み）
     const place=textOf(it,'dcndl:publicationPlace');
-    if(place&&place!=='JP') return;
+    if(place&&!/^j[ap]/i.test(place)) return;
     let isbn=null;
     Array.prototype.forEach.call(it.getElementsByTagName('dc:identifier'),n=>{
-      if(isbn||n.getAttribute('xsi:type')!=='dcndl:ISBN') return;
+      if(isbn||!/^dcndl:ISBN(13)?$/.test(n.getAttribute('xsi:type')||'')) return;
       const raw=n.textContent.replace(/[^0-9Xx]/g,'');
       isbn = raw.length===10 ? isbn13from10(raw) : raw;
     });
     if(!isbn||!isISBN13(isbn)) return;
-    const base=ndlTitle(textOf(it,'dc:title')); if(!base) return;
+    const sp=ndlSplit(textOf(it,'dc:title'));
+    const base=sp.base; if(!base) return;
     const vol=volOf(textOf(it,'dcndl:volume'));
-    out.push({isbn, title: vol?base+' '+vol:base,
+    out.push({isbn, alt:sp.alt, title: vol?base+' '+vol:base,
       // 「夏目, 漱石, 1867-1916」の形で来る。生没年は落として姓名だけ繋ぐ
       author:(textOf(it,'dc:creator')||'').replace(/,\s*\d{4}-(\d{4})?/g,'').replace(/,\s*/g,''),
       publisher:textOf(it,'dc:publisher'),
@@ -484,13 +493,12 @@ async function ndlQuery(p){
 // 国会図書館が巻数を持っていればそれを使い、無いときだけ題名から推測する
 const seriesOf=x=>(x&&x.vol)?{series:x.series,vol:x.vol}:parseSeries(x.title);
 
-// 国会図書館は関連度順に返してくれないので、入力に近いものを手前へ寄せる
+// 国会図書館は関連度順に返してくれないので、入力に近いものを手前へ寄せる。
+// 原題（OVERLORD など）でも比べ、英語で探した人にも近い順で見せる
 function rank(list,q){
   const k=skey(q);
-  const score=x=>{
-    const s=skey(x.series||x.title);
-    return s===k?0 : s.indexOf(k)===0?1 : s.indexOf(k)>=0?2 : 3;
-  };
+  const one=s=>s===k?0 : s.indexOf(k)===0?1 : s.indexOf(k)>=0?2 : 3;
+  const score=x=>Math.min(one(skey(x.series||x.title)), x.alt?one(skey(x.alt)):3);
   return list.map((x,i)=>[score(x),x.vol||999,i,x])
              .sort((a,b)=>a[0]-b[0]||a[1]-b[1]||a[2]-b[2]).map(z=>z[3]);
 }
@@ -504,9 +512,12 @@ async function searchBooks(q){
     try{ out=await ndlQuery({isbn:digits,cnt:5}); }catch(e){ lastError=e; }
     if(out.length) return dedupe(out);
   }
+  /* 英数字の入力（OVERLORD 等の原題）は、題名検索だけだと外伝ばかり集まって
+     本編が入らないことがある。全項目検索も必ず足してから並べ直す。 */
+  const ascii=/^[\x20-\x7E]+$/.test(t);
   for(const p of [{title:t},{any:t}]){
     try{ out=out.concat(await ndlQuery(Object.assign({cnt:200},p))); }catch(e){ lastError=e; }
-    if(out.length>=8) break;
+    if(out.length>=8&&!ascii) break;
   }
   // 入力に近い見出しを先に並べてから重複を落とす。こうすると残るのが正しい見出しになる
   return dedupe(rank(out,t));
@@ -521,8 +532,9 @@ async function searchSeries(name,prefer){
   try{ out=await ndlQuery({title:name,cnt:500}); }catch(e){ lastError=e; }
   if(out.length<3){ try{ out=out.concat(await ndlQuery({any:name,cnt:200})); }catch(e){ lastError=e; } }
   const k=skey(name);
+  // 原題（OVERLORD 等）で探されたときも、日本語見出しの束に正しく集める
   const mine=out.map(x=>Object.assign({},x,seriesOf(x)))
-                .filter(x=>x.vol&&skey(x.series)===k);
+                .filter(x=>x.vol&&(skey(x.series)===k||(x.alt&&skey(x.alt)===k)));
   /* 同じ題名に小説版と漫画版が同居することがある。
      「オーバーロード」は 丸山くがね＝小説19巻 と 深山フギン＝漫画8巻 が同じ見出し。
      巻を最も多く持つ著者を本編とみなし、そちらを優先して採る。
@@ -556,7 +568,10 @@ async function add(isbn,opts){
   Object.keys(b).forEach(k=>{ if(k[0]==='_') delete b[k]; });   // 表示用の作業フィールドは保存しない
   Object.assign(b,seriesOf(b),{added:Date.now(),
     own:opts.own||'paper', status:'stock', anime:false, rate:0, place:'', note:''});
-  books.unshift(b); await save(); render();
+  books.unshift(b);
+  /* まとめて入れるときは defer を立て、呼び出し側が最後に1回だけ保存・描画する。
+     1冊ごとに棚全体を書き出して描き直すと、巻数ぶん二乗で遅くなる */
+  if(!opts.defer){ await save(); render(); }
   return b;
 }
 
@@ -1040,7 +1055,7 @@ function openFind(q){
   openWith(`
     <h2>探して棚に入れる</h2>
     <p class="meta">タイトル・著者名でも、13桁のISBNでも。持っていない本もそのまま登録できます。
-      日本語の題名のほうがよく当たります（例：Overlord → オーバーロード）。</p>
+      打っている途中で下に候補が出ます。英語の原題（OVERLORD など）からも候補で日本語名に移れます。</p>
     <div class="field"><input id="fq" value="${esc(q||'')}" placeholder="例）薬屋のひとりごと ／ 9784041...">
     </div>
     <div class="chips" id="fpre">${presets().map(x=>
@@ -1057,6 +1072,53 @@ function openFind(q){
     addOwn=t.dataset.v;
     [...document.getElementById('fo').children].forEach(x=>x.classList.toggle('on',x===t));
   };
+  /* 打っている途中で作品名の候補を出す。
+     手が止まって500ms待ってから1回だけ引く（連打すると国会図書館に断られる）。
+     原題（OVERLORD 等）で当たったときは日本語名に橋渡しする。 */
+  const fpre=document.getElementById('fpre');
+  const chipsOf=list=>list.map(x=>
+    `<button class="chip" data-q="${esc(x.q)}">${esc(x.label)}</button>`).join('');
+  const preset0=presets().map(x=>({q:x,label:x}));
+  let sugT=0, sugSeq=0;
+  const sugCache=new Map();
+  document.getElementById('fq').addEventListener('input',()=>{
+    clearTimeout(sugT);
+    const v=norm(document.getElementById('fq').value).trim();
+    if(v.length<2||/^[\d\s\-]+$/.test(v)){ fpre.innerHTML=chipsOf(preset0); return; }
+    sugT=setTimeout(async()=>{
+      const seq=++sugSeq;
+      let items=sugCache.get(v);
+      if(!items){
+        try{ items=await ndlQuery({title:v,cnt:25}); }catch(e){ items=[]; }
+        sugCache.set(v,items);
+      }
+      if(seq!==sugSeq) return;              // 打ち直しで古くなった応答は捨てる
+      const seen=new Set(), out=[];
+      rank(items,v).forEach(x=>{
+        const nm=x.series||x.title, kk=skey(nm);
+        if(seen.has(kk)||out.length>=6) return;
+        seen.add(kk);
+        const viaAlt=x.alt&&skey(x.alt).indexOf(skey(v))>=0&&skey(nm).indexOf(skey(v))<0;
+        out.push({q:nm, label:viaAlt?nm+'（'+x.alt+'）':nm});
+      });
+      /* 原題で引くと外伝ばかり並ぶことがある（OVERLORD → 〈新〉世界編、不死者のOh!…）。
+         候補の半数が同じ書き出しなら、その共通部分＝本体の作品名を先頭に足す */
+      if(out.length>=3){
+        const names=out.map(x=>x.q);
+        let pre='';
+        names.forEach(anchor=>{
+          for(let L=anchor.length;L>pre.length;L--){
+            const p=anchor.slice(0,L);
+            if(p.length>=3&&names.filter(s=>s.startsWith(p)).length*2>=names.length){ pre=p; break; }
+          }
+        });
+        pre=pre.trim();
+        if(pre.length>=3&&/[^\x00-\x7F]/.test(pre)&&!seen.has(skey(pre)))
+          out.unshift({q:pre,label:pre});
+      }
+      if(out.length) fpre.innerHTML=chipsOf(out.slice(0,7));
+    },500);
+  });
   const run=async()=>{
     const raw=document.getElementById('fq').value.trim();
     if(!raw) return;
@@ -1109,9 +1171,17 @@ function bulkBar(items){
   const best=[...m.values()].sort((a,b)=>b.size-a.size)[0];
   bulkList = (best&&best.size>=2)
     ? [...best.values()].sort((a,b)=>seriesOf(a).vol-seriesOf(b).vol) : [];
-  return bulkList.length
-    ? `<button class="bulk" id="bulk">${esc(seriesOf(bulkList[0]).series)} を${bulkList.length}冊まとめて追加</button>`
-    : '';
+  if(!bulkList.length) return '';
+  /* 範囲は打たせずに選ばせる。「1-15」のような自由記述は読み違いのもと */
+  const vols=bulkList.map(x=>seriesOf(x).vol);
+  return `<div class="field" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0 0">
+      <select id="bfrom">${vols.map(v=>`<option value="${v}">${v}</option>`).join('')}</select>
+      <span class="meta" style="white-space:nowrap">巻から</span>
+      <select id="bto"><option value="all">最後まで（見つかった全巻）</option>${
+        vols.slice().reverse().map(v=>`<option value="${v}">${v}巻</option>`).join('')}</select>
+      <span class="meta" style="white-space:nowrap">を</span>
+    </div>
+    <button class="bulk" id="bulk">${esc(seriesOf(bulkList[0]).series)} をまとめて追加</button>`;
 }
 
 /* ══ 完結の印と設定（meta） ══
@@ -1178,10 +1248,9 @@ async function fillSeries(g,own){
   }
   let n=0;
   for(const x of want){
-    box.innerHTML=`<p class="meta" style="padding:12px 0">入れています… ${n}/${want.length}</p>`;
-    if(await add(x.isbn,{own,quiet:true,rec:x})) n++;
+    if(await add(x.isbn,{own,quiet:true,rec:x,defer:true})) n++;
   }
-  render();
+  await save(); render();
   box.innerHTML=`<p class="meta" style="padding:12px 0;color:var(--jade)">`
     +`${n}冊を${ownLabel(own)}で追加しました（全${all.length}巻）。</p>`;
 }
@@ -1232,6 +1301,7 @@ function openBulkInput(){
     </div>
     <div class="field" style="margin-top:12px">
       <textarea id="blines" rows="6" placeholder="オーバーロード 1-15&#10;よつばと! 16"></textarea></div>
+    <div id="bprev"></div>
     <div class="lab">持ちかた</div>
     <div class="seg" id="bo">${OWNS.map(o=>
       `<button data-v="${o.id}" class="${addOwn===o.id?'on':''}">${o.label}</button>`).join('')}</div>
@@ -1242,6 +1312,26 @@ function openBulkInput(){
     addOwn=t.dataset.v;
     [...document.getElementById('bo').children].forEach(x=>x.classList.toggle('on',x===t));
   };
+  /* どう読み取られたかを打ちながら見せる。
+     「1-5,8」の書き損じに、入れてしまってから気づくのでは遅い */
+  const blines=document.getElementById('blines'), bprev=document.getElementById('bprev');
+  // 連続した巻は「1〜15」に圧縮して見せる
+  const runs=vs=>{ const a=[...vs].sort((x,y)=>x-y), o=[];
+    for(let i=0;i<a.length;){ let j=i;
+      while(j+1<a.length&&a[j+1]===a[j]+1) j++;
+      o.push(i===j?String(a[i]):a[i]+'〜'+a[j]); i=j+1; }
+    return o.join('、'); };
+  blines.addEventListener('input',()=>{
+    const lines=blines.value.split(/\r?\n/).map(parseLine).filter(Boolean);
+    bprev.innerHTML=!lines.length?'':
+      `<div class="lab">読み取り</div><div class="rows">`+lines.map(l=>{
+        const r=l.range;
+        const t=!r?'見つかった全巻'
+          : r.list?runs(r.list)+'巻'
+          : `1〜${r.to}巻`;
+        return `<div class="r"><span>${esc(l.name)}</span><span>${esc(t)}</span></div>`;
+      }).join('')+`</div>`;
+  });
   document.getElementById('bgo').onclick=runBulkInput;
 }
 
@@ -1263,7 +1353,7 @@ async function runBulkInput(){
     }else{
       const want=found.filter(x=>inRange(x.vol,range)&&!books.some(b=>b.isbn===x.isbn));
       let n=0;
-      for(const x of want) if(await add(x.isbn,{own:addOwn,quiet:true,rec:x})) n++;
+      for(const x of want) if(await add(x.isbn,{own:addOwn,quiet:true,rec:x,defer:true})) n++;
       total+=n;
       const miss=range&&range.list
         ? [...range.list].filter(v=>!found.some(x=>x.vol===v))
@@ -1273,7 +1363,7 @@ async function runBulkInput(){
     }
     await sleep(250);                       // 国会図書館に連打しない
   }
-  render();
+  await save(); render();
   box.innerHTML=`<div class="lab">結果</div><div class="rows">`
     + rows.map(([a,b,ok])=>`<div class="r"><span>${esc(a)}</span>
         <span style="color:${ok?'var(--jade)':'var(--alert)'}">${esc(b)}</span></div>`).join('')
@@ -1422,13 +1512,18 @@ function wire(box,items,q,own){
     bulk.textContent='全巻を探しています…';
     let list=await searchSeries(name);
     if(list.length<bulkList.length) list=bulkList;          // 拾えなければ見えている分だけ
-    list=list.filter(x=>!books.some(b=>b.isbn===x.isbn));
+    // 範囲の指定（プルダウン）があればそれで絞る
+    const from=+((box.querySelector('#bfrom')||{}).value||1);
+    const toSel=(box.querySelector('#bto')||{}).value||'all';
+    list=list.map(x=>Object.assign({},x,seriesOf(x)))
+      .filter(x=>!books.some(b=>b.isbn===x.isbn))
+      .filter(x=>!x.vol||(x.vol>=from&&(toSel==='all'||x.vol<=+toSel)));
     let n=0;
     for(const x of list){
       // 書誌は検索で取れている。ここで引き直さないので待ち時間も要らない
-      if(await add(x.isbn,{own:pick(),quiet:true,rec:x})) n++;
-      bulk.textContent=`追加しています… ${n}/${list.length}`;
+      if(await add(x.isbn,{own:pick(),quiet:true,rec:x,defer:true})) n++;
     }
+    await save(); render();
     if(!n){ bulk.textContent='追加できる巻がありませんでした'; bulk.classList.add('done'); return;
     }
     bulk.textContent=`${n}冊を${ownLabel(pick())}で追加しました`;
