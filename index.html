@@ -1290,15 +1290,9 @@ const inRange=(v,r)=>!r ? true : (r.list ? r.list.has(v) : (v>=r.from&&v<=r.to))
 function openBulkInput(){
   openWith(`
     <h2>まとめて入力</h2>
-    <p class="meta">1行に1作品。題名のあとに持っている巻を書いてください。
-      題名を打つのは1回だけで済みます。</p>
-    <div class="lab">書きかた</div>
-    <div class="rows">
-      <div class="r"><span>オーバーロード 1-15</span><span>1〜15巻</span></div>
-      <div class="r"><span>よつばと! 16</span><span>1〜16巻</span></div>
-      <div class="r"><span>幼女戦記 1-5,8</span><span>1〜5巻と8巻</span></div>
-      <div class="r"><span>薬屋のひとりごと</span><span>見つかった全巻</span></div>
-    </div>
+    <p class="meta">1行に1作品、題名だけでかまいません。調べたあとに、
+      見つかった巻の範囲をプルダウンで選んでから棚に入れます。
+      題名のあとに巻を書いておくと、それが選択の初期値になります（例：よつばと! 16）。</p>
     <div class="field" style="margin-top:12px">
       <textarea id="blines" rows="6" placeholder="オーバーロード 1-15&#10;よつばと! 16"></textarea></div>
     <div id="bprev"></div>
@@ -1306,7 +1300,7 @@ function openBulkInput(){
     <div class="seg" id="bo">${OWNS.map(o=>
       `<button data-v="${o.id}" class="${addOwn===o.id?'on':''}">${o.label}</button>`).join('')}</div>
     <div id="bres"></div>
-    <div class="acts"><button class="save" id="bgo">棚に入れる</button></div>`);
+    <div class="acts"><button class="save" id="bgo">調べて巻を選ぶ</button></div>`);
   document.getElementById('bo').onclick=e=>{
     const t=e.target.closest('[data-v]'); if(!t) return;
     addOwn=t.dataset.v;
@@ -1335,6 +1329,10 @@ function openBulkInput(){
   document.getElementById('bgo').onclick=runBulkInput;
 }
 
+/* 2段階にする。まず全作品を調べて「見つかった巻」を出し、
+   範囲はプルダウンで選んでから棚に入れる。自由記述の読み違いで
+   入れてしまう事故を、選ばせることで潰す。 */
+let bulkFound=[];
 async function runBulkInput(){
   const box=document.getElementById('bres');
   const go=document.getElementById('bgo');
@@ -1342,35 +1340,75 @@ async function runBulkInput(){
     .map(parseLine).filter(Boolean);
   if(!lines.length){ toast('1行に1作品ずつ書いてください',true); return; }
   go.disabled=true;
-  const rows=[]; let total=0;
+  bulkFound=[];
   for(let i=0;i<lines.length;i++){
     const {name,range}=lines[i];
     box.innerHTML=`<p class="meta" style="padding:10px 0">${esc(name)} を調べています（${i+1}/${lines.length}）…</p>`;
     let found=[];
     try{ found=await searchSeries(name); }catch(e){}
-    if(!found.length){
-      rows.push([name, lastError?'通信が届きませんでした':'見つかりませんでした', false]);
-    }else{
-      const want=found.filter(x=>inRange(x.vol,range)&&!books.some(b=>b.isbn===x.isbn));
+    bulkFound.push({i, name, range, found, err:!found.length&&!!lastError, dirty:false});
+    await sleep(250);                       // 国会図書館に連打しない
+  }
+  go.disabled=false;
+  const rows=bulkFound.map(r=>{
+    if(!r.found.length) return `<div class="rows"><div class="r"><span>${esc(r.name)}</span>
+      <span style="color:var(--alert)">${r.err?'通信が届きませんでした':'見つかりませんでした'}</span></div></div>`;
+    const vols=r.found.map(x=>x.vol);
+    // 題名に書いた範囲は初期値として反映する
+    const from=r.range?(r.range.list?Math.min(...r.range.list):r.range.from):vols[0];
+    const to  =r.range?(r.range.list?Math.max(...r.range.list):r.range.to):null;
+    return `<div class="lab">${esc(r.found[0].series||r.name)}
+        <span style="float:right" id="bn${r.i}"></span></div>
+      <div class="field" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <select data-bf="${r.i}">${vols.map(v=>
+          `<option value="${v}"${v===from?' selected':''}>${v}</option>`).join('')}</select>
+        <span class="meta" style="white-space:nowrap">巻から</span>
+        <select data-bt="${r.i}"><option value="all">最後まで（${vols[vols.length-1]}巻）</option>${
+          vols.slice().reverse().map(v=>
+          `<option value="${v}"${to===v?' selected':''}>${v}巻</option>`).join('')}</select>
+        <span class="meta" style="white-space:nowrap">まで</span>
+      </div>`;
+  }).join('');
+  box.innerHTML=`<div class="lab">見つかった作品</div>`+rows
+    +`<button class="bulk" id="bcommit">選んだ巻を棚に入れる</button>`;
+  // いま選んでいる範囲で実際に入る巻（棚にある巻・書いた範囲の外は数えない）
+  const pickOf=r=>{
+    const f=+((box.querySelector(`[data-bf="${r.i}"]`)||{}).value||1);
+    const t=((box.querySelector(`[data-bt="${r.i}"]`)||{}).value)||'all';
+    return r.found.filter(x=>x.vol>=f&&(t==='all'||x.vol<=+t)
+      &&((r.dirty||!r.range)?true:inRange(x.vol,r.range))   // 触ったらプルダウン優先
+      &&!books.some(b=>b.isbn===x.isbn));
+  };
+  const counts=()=>bulkFound.forEach(r=>{
+    const el=document.getElementById('bn'+r.i);
+    if(el) el.textContent=pickOf(r).length+'冊';
+  });
+  counts();
+  box.onchange=e=>{
+    const i=e.target.dataset.bf!=null?e.target.dataset.bf:e.target.dataset.bt;
+    if(i==null) return;
+    bulkFound[+i].dirty=true;
+    counts();
+  };
+  document.getElementById('bcommit').onclick=async()=>{
+    const btn=document.getElementById('bcommit');
+    btn.disabled=true; btn.textContent='入れています…';
+    const done=[]; let total=0;
+    for(const r of bulkFound){
+      if(!r.found.length){ done.push([r.name,'見つかりませんでした',false]); continue; }
+      const want=pickOf(r);
       let n=0;
       for(const x of want) if(await add(x.isbn,{own:addOwn,quiet:true,rec:x,defer:true})) n++;
       total+=n;
-      const miss=range&&range.list
-        ? [...range.list].filter(v=>!found.some(x=>x.vol===v))
-        : (range?[]:[]);
-      rows.push([found[0].series||name,
-        `${n}冊追加`+(miss.length?`（${miss.join('、')}巻は無し）`:''), n>0]);
+      done.push([r.found[0].series||r.name, n?`${n}冊追加`:'追加できる巻なし', n>0]);
     }
-    await sleep(250);                       // 国会図書館に連打しない
-  }
-  await save(); render();
-  box.innerHTML=`<div class="lab">結果</div><div class="rows">`
-    + rows.map(([a,b,ok])=>`<div class="r"><span>${esc(a)}</span>
-        <span style="color:${ok?'var(--jade)':'var(--alert)'}">${esc(b)}</span></div>`).join('')
-    + `</div>`;
-  go.disabled=false;
-  go.textContent=total?`${total}冊を${ownLabel(addOwn)}で追加しました`:'追加できませんでした';
-  if(total) go.classList.add('done');
+    await save(); render();
+    box.innerHTML=`<div class="lab">結果</div><div class="rows">`
+      + done.map(([a,b,ok])=>`<div class="r"><span>${esc(a)}</span>
+          <span style="color:${ok?'var(--jade)':'var(--alert)'}">${esc(b)}</span></div>`).join('')
+      + `</div>`;
+    toast(total?`${total}冊を${ownLabel(addOwn)}で追加しました`:'追加できませんでした',!total);
+  };
 }
 
 /* ══ 新刊を調べる ══
