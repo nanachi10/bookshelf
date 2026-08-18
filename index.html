@@ -77,6 +77,8 @@ main{padding:14px 16px 130px}
 .pickgrid .v{min-width:38px;height:42px;font-size:13px;border-radius:4px;cursor:pointer}
 .v.can{border:1px dashed var(--ink-4);color:var(--dim)}
 .v.pick{background:linear-gradient(180deg,var(--foil),var(--foil-dim));color:#1A1305;font-weight:700}
+/* 棚から出す選択。入れる（金）と取り違えないよう赤で示す */
+.v.kill{background:var(--alert);color:#fff;font-weight:700;border:0}
 .legend{display:flex;flex-wrap:wrap;gap:9px;margin-top:12px;font-size:10.5px;color:var(--dim)}
 .legend span{display:flex;align-items:center;gap:4px}
 .key{width:11px;height:14px;border-radius:1px 2px 2px 1px;display:inline-block}
@@ -230,6 +232,10 @@ video{width:100%;height:100%;object-fit:cover}
 .hit .go{flex:0 0 auto;background:var(--foil);color:#1A1305;font-weight:700;
   padding:8px 14px;border-radius:8px;font-size:12.5px}
 .hit .go.done{background:transparent;color:var(--dim);font-weight:400}
+/* 選択の印。指で押す前提なので枠を大きめに取る */
+.tick{flex:0 0 26px;height:26px;border-radius:6px;border:1px solid var(--ink-4);
+  display:flex;align-items:center;justify-content:center;font-size:15px;color:var(--dim)}
+.tick.on{background:var(--alert);border-color:var(--alert);color:#fff;font-weight:700}
 .bulk{display:block;width:100%;padding:12px;border-radius:11px;text-align:center;
   background:var(--foil);color:#1A1305;font-weight:700;font-size:13.5px;margin:8px 0 4px}
 .bulk.done{background:transparent;border:1px solid var(--ink-4);color:var(--dim);font-weight:400}
@@ -1140,12 +1146,16 @@ function openSeries(key){
       g.buy.length?` · 未所持 ${g.buy.join('、')}`:''}</p>
     <div class="covers" style="margin-top:12px">${covers}</div>
     ${g.extra.length?`<div class="lab">同じ巻が重なっています</div>
-      <p class="meta">別の版か、版元違いの重版かもしれません。要らないほうは開いて棚から出せます。</p>
+      <p class="meta">別の版か、版元違いの重版かもしれません。</p>
       <div class="covers">${g.extra.map(b=>
         `<button data-o="${b.isbn}"><div class="c ${b.own==='none'?'ghost':''}">${jacketImg(b)}</div>
-           <div class="num">${b.vol}</div></button>`).join('')}</div>`:''}
+           <div class="num">${b.vol}</div></button>`).join('')}</div>
+      <div class="chips" style="margin-bottom:4px">${g.extra.map(b=>
+        `<button class="chip" data-rmdup="${esc(b.isbn)}">${b.vol}巻の重なりを出す（${
+          esc((b.publisher||'版元不明').slice(0,12))}）</button>`).join('')}</div>`:''}
     <div class="menu">
       <button id="volpick">巻を足す（前の巻でも新刊でも、選んで入れる）</button>
+      <button id="volrm">巻を選んで棚から出す</button>
       <button id="spinoff">外伝・スピンオフを探す</button>
       <button id="done"${isDone(g)?' class="on"':''}>${isDone(g)?'完結にしている':'完結にする'}</button>
     </div>
@@ -1162,7 +1172,15 @@ function openSeries(key){
     <div class="seg" id="bown" style="margin-top:6px">${OWNS.map(o=>
       `<button data-v="${o.id}">${o.label}にする</button>`).join('')}</div>`);
   document.getElementById('volpick').onclick=()=>volPicker(g);
+  document.getElementById('volrm').onclick=()=>volRemover(g);
   document.getElementById('spinoff').onclick=()=>spinoffs(g);
+  // 重なっている巻は、その1冊だけをその場で外せるようにする
+  card.querySelectorAll('[data-rmdup]').forEach(el=>el.onclick=async()=>{
+    const b=books.find(x=>x.isbn===el.dataset.rmdup); if(!b) return;
+    if(!(await removeMany([b],g.series))) return;
+    const g2=build(books).find(x=>x.key===g.key);
+    if(g2) openSeries(g2.key); else closeSheet();
+  });
   document.getElementById('done').onclick=e=>{
     const on=toggleDone(g);
     e.currentTarget.classList.toggle('on',on);
@@ -1316,6 +1334,69 @@ async function volPicker(g,pre){
   };
   draw();
 }
+/* ══ まとめて棚から出す ══
+   間違って入れた版を丸ごと、あるいは要らない巻だけを消したい。
+   1冊ずつシートを開いて消すのは現実的でないので、まとめて外す。
+   消すのは取り返しがつかないので、必ず戻せるようにしておく。 */
+async function removeMany(list,label){
+  if(!list.length){ toast('選んでください',true); return 0; }
+  // どこに入っていたかを覚えておき、戻すときは元の位置に差し直す
+  const backup=list.map(b=>({b,i:books.indexOf(b)})).sort((a,b)=>a.i-b.i);
+  const kill=new Set(list);
+  books=books.filter(x=>!kill.has(x));
+  await save(); render();
+  logAct('まとめて削除',`${label}｜${list.length}冊`);
+  toast(`${list.length}冊を棚から出しました`,false,{label:'元に戻す',fn:async()=>{
+    backup.forEach(({b,i})=>books.splice(Math.min(i,books.length),0,b));
+    await save(); render();
+    logAct('削除取消',`${label}｜${list.length}冊`);
+    toast(`${list.length}冊を戻しました`);
+  }});
+  return list.length;
+}
+
+/* 巻ピッカーの裏返し。持っている巻をタップで選んで外す。
+   「小説版と漫画版が混ざってしまった」ような取り違えを畳んで直せる。 */
+function volRemover(g){
+  const box=document.getElementById('found');
+  const sel=new Set();
+  const draw=()=>{
+    const rows=g.items.filter(b=>b.vol).sort((a,b)=>a.vol-b.vol);
+    const dups=g.extra.length;
+    let chips='';
+    rows.forEach(b=>{
+      chips+=`<button class="v ${sel.has(b.isbn)?'kill':vcls(b)}" data-rm="${esc(b.isbn)}">${b.vol}</button>`;
+    });
+    const novol=g.items.filter(b=>!b.vol);
+    novol.forEach(b=>{
+      chips+=`<button class="v ${sel.has(b.isbn)?'kill':vcls(b)}" data-rm="${esc(b.isbn)}">?</button>`;
+    });
+    box.innerHTML=`<div class="lab">出す巻を選ぶ（${rows.length+novol.length}冊）</div>`
+      +`<p class="meta">タップで選びます。${dups?'同じ巻が重なっているぶんも並んでいます。':''}</p>`
+      +`<div class="strip pickgrid" style="margin-top:6px">${chips}</div>`
+      +`<div class="chips" style="margin-top:8px">
+          <button class="chip" id="rmall">全部</button>
+          <button class="chip" id="rmnone">選び直す</button></div>`
+      +`<button class="bulk ${sel.size?'':'done'}" id="rmgo">選んだ${sel.size}冊を棚から出す</button>`;
+    box.onclick=async e=>{
+      const t=e.target.closest('[data-rm]');
+      if(t){ const k=t.dataset.rm; sel.has(k)?sel.delete(k):sel.add(k); draw(); return; }
+      if(e.target.closest('#rmall')){ g.items.forEach(b=>sel.add(b.isbn)); draw(); return; }
+      if(e.target.closest('#rmnone')){ sel.clear(); draw(); return; }
+      if(e.target.closest('#rmgo')){
+        const list=g.items.filter(b=>sel.has(b.isbn));
+        if(!(await removeMany(list,g.series))) return;
+        // 束ごと消えたときはシートを閉じる。残っていれば引き直す
+        const g2=build(books).find(x=>x.key===g.key)
+              ||build(books).find(x=>x.series&&mkey(x.series)===mkey(g.series)
+                   &&akey(x.author)===akey(g.author));
+        if(g2) openSeries(g2.key); else closeSheet();
+      }
+    };
+  };
+  draw();
+}
+
 /* 19巻を1冊ずつ触るのは現実的でないので、範囲でまとめて変えられるようにする。
    棚に無い巻は飛ばす（未登録の巻を勝手に作らない） */
 async function bulkApply(g,upto,fn,label){
@@ -2070,13 +2151,36 @@ document.getElementById('stop').onclick=()=>stopScan();
 /* ══ メニュー ══ */
 document.getElementById('more').onclick=()=>{
   const gs=build(books), authors={};
+  const fresh=gs.reduce((m,g)=>m+newOf(g).length,0);
   books.forEach(b=>(b.author||'').split(/[、,\/／]/).forEach(a=>{
     a=a.trim().replace(/\s*[／\/]?\s*著$/,''); if(a) authors[a]=(authors[a]||0)+1;
   }));
   const top=Object.entries(authors).sort((a,b)=>b[1]-a[1]).slice(0,3);
   const n=f=>books.filter(f).length;
   openWith(`
-    <h2>この棚のこと</h2>
+    <h2>棚をあつかう</h2>
+    <div class="lab">入れる</div>
+    <div class="menu">
+      <button id="binput">まとめて入力（題名と巻数で）</button>
+      <button id="usb">連続スキャン（USBリーダー）</button>
+    </div>
+    <div class="lab">調べる</div>
+    <div class="menu">
+      <button id="new">新刊を調べる${fresh?`　<span class="fresh">新刊${fresh}</span>`:''}</button>
+    </div>
+    <div class="lab">片づける</div>
+    <div class="menu">
+      <button id="tidy">まとめて棚から出す</button>
+    </div>
+    <div class="lab">控えと記録</div>
+    <div class="menu">
+      <button id="ejson">JSON で書き出す</button>
+      <button id="ecsv">CSV で書き出す</button>
+      <button id="imp">JSON を読み込む</button>
+      <button id="oplog">操作の記録</button>
+      <button id="net">通信を確かめる</button>
+    </div>
+    <div class="lab">この棚のこと</div>
     <div class="rows">
       <div class="r"><span>紙で所持</span><span>${n(b=>b.own==='paper')}</span></div>
       <div class="r"><span>電子で所持</span><span>${n(b=>b.own==='digital')}</span></div>
@@ -2088,17 +2192,8 @@ document.getElementById('more').onclick=()=>{
       <div class="r"><span>今年の読了</span><span>${n(b=>b.readAt&&new Date(b.readAt).getFullYear()===new Date().getFullYear())}</span></div>
       <div class="r"><span>アニメで見た</span><span>${n(b=>b.anime)}</span></div>
       ${top.map(([a,c])=>`<div class="r"><span>${esc(a)}</span><span>${c}冊</span></div>`).join('')}
-    </div>
-    <div class="menu" style="margin-top:16px">
-      <button id="binput">まとめて入力（題名と巻数で）</button>
-      <button id="new">新刊を調べる</button>
-      <button id="usb">連続スキャン（USBリーダー）</button>
-      <button id="ejson">JSON で書き出す</button>
-      <button id="ecsv">CSV で書き出す</button>
-      <button id="imp">JSON を読み込む</button>
-      <button id="oplog">操作の記録</button>
-      <button id="net">通信を確かめる</button>
     </div>`);
+  document.getElementById('tidy').onclick=()=>openTidy();
   document.getElementById('oplog').onclick=()=>openLog();
   document.getElementById('binput').onclick=()=>openBulkInput();
   document.getElementById('usb').onclick=()=>openScanUSB();
@@ -2137,6 +2232,47 @@ document.getElementById('more').onclick=()=>{
     inp.click();
   };
 };
+/* ══ まとめて棚から出す（棚全体から） ══
+   版を取り違えて丸ごと入ってしまったときは、作品ごと外したい。
+   束を選んでから消す。巻単位で選びたいときはシリーズ画面へ回す。 */
+function openTidy(){
+  const sel=new Set();
+  const draw=()=>{
+    const gs=build(books);
+    const row=g=>{
+      const on=sel.has(g.key);
+      return `<button class="hit" data-t="${esc(g.key)}">
+        <span class="tick ${on?'on':''}">${on?'✓':''}</span>
+        <div class="n">${esc(g.series||g.items[0].title)}${
+          g.edition?`<em class="alt">${esc(g.edition.slice(0,10))}</em>`:''}
+          <small>${esc((g.author||'').split(/[、,\/／]/)[0])}${
+            g.isSeries?` / ${g.items.length}冊（最新${g.max}巻）`:` / ${g.items.length}冊`}</small></div>
+        </button>`;
+    };
+    const series=gs.filter(g=>g.isSeries), singles=gs.filter(g=>!g.isSeries);
+    const cnt=gs.filter(g=>sel.has(g.key)).reduce((n,g)=>n+g.items.length,0);
+    document.getElementById('card').innerHTML=`<h2>まとめて棚から出す</h2>
+      <p class="meta">出す作品を選んでください。巻を選んで出したいときは、
+        棚の札から作品を開いて「巻を選んで棚から出す」へ。</p>
+      ${series.length?`<div class="lab">シリーズ</div>`+series.map(row).join(''):''}
+      ${singles.length?`<div class="lab">単巻</div>`+singles.map(row).join(''):''}
+      <button class="bulk ${cnt?'':'done'}" id="tgo">選んだ${cnt}冊を棚から出す</button>`;
+    const card2=document.getElementById('card');
+    card2.onclick=async e=>{
+      const t=e.target.closest('[data-t]');
+      if(t){ const k=t.dataset.t; sel.has(k)?sel.delete(k):sel.add(k); draw(); return; }
+      if(e.target.closest('#tgo')){
+        const list=gs.filter(g=>sel.has(g.key)).flatMap(g=>g.items);
+        const label=gs.filter(g=>sel.has(g.key)).map(g=>g.series||'単巻').join('、').slice(0,40);
+        if(!(await removeMany(list,label))) return;
+        closeSheet();
+      }
+    };
+  };
+  openWith('');
+  draw();
+}
+
 /* ══ 操作の記録の閲覧 ══ */
 function openLog(){
   const fmt=t=>{ const d=new Date(t);
