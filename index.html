@@ -365,6 +365,14 @@ const norm=s=>String(s||'').replace(/[\uFF01-\uFF5E]/g,
   c=>String.fromCharCode(c.charCodeAt(0)-0xFEE0)).replace(/\u3000/g,' ').trim();
 // シリーズ名の突き合わせ鍵。表記ゆれで同じ作品が二段に割れるのを防ぐ
 const skey=s=>norm(s).toLowerCase().replace(/\s+/g,'');
+/* 副題を落とした「主題名」。国会図書館は副題を " : "（両側に空白）で繋ぐ規約で、
+   同じ作品なのに巻の途中から副題つきの別見出しになることがある。
+   「電波教師」は1〜4巻と9巻が副題なし、5巻以降が
+   「電波教師 : HE IS A ULTIMATE TEACHER」で、完全一致で絞ると前半が永久に拾えない。
+   空白なしのコロン（「Re:ゼロから始める異世界生活」）は題名の一部なので切らない。 */
+const mainTitle=s=>{ const t=norm(s), i=t.indexOf(' : ');
+  return i>0?t.slice(0,i).trim():t; };
+const mkey=s=>skey(mainTitle(s));
 function parseSeries(raw){
   let t=norm(raw);
   t=t.replace(/\s*[（(][^（）()]*[)）]\s*$/,m=>/[\d上中下]/.test(m)?m:'');
@@ -558,23 +566,28 @@ const dedupe=list=>{ const s=new Set();
 async function searchSeriesAll(name){
   lastError=null;
   let out=[];
-  try{ out=await ndlQuery({title:name,cnt:500}); }catch(e){ lastError=e; }
-  if(out.length<3){ try{ out=out.concat(await ndlQuery({any:name,cnt:200})); }catch(e){ lastError=e; } }
-  const k=skey(name);
+  const q=mainTitle(name);                      // 副題つきの名前で引くと当たらないことがある
+  try{ out=await ndlQuery({title:q,cnt:500}); }catch(e){ lastError=e; }
+  if(out.length<3){ try{ out=out.concat(await ndlQuery({any:q,cnt:200})); }catch(e){ lastError=e; } }
+  const k=skey(name), mk=mkey(name);
+  const cand=out.map(x=>Object.assign({},x,seriesOf(x))).filter(x=>x.vol);
   // 原題（OVERLORD 等）で探されたときも、日本語見出しの束に正しく集める
-  const mine=out.map(x=>Object.assign({},x,seriesOf(x)))
-                .filter(x=>x.vol&&(skey(x.series)===k||(x.alt&&skey(x.alt)===k)));
-  const eds=new Map();
-  mine.forEach(x=>{
-    const ak=akey(x.author||'');
-    if(!eds.has(ak)) eds.set(ak,{ak, author:x.author||'', vols:new Map()});
-    const e=eds.get(ak);
-    if(!e.vols.has(x.vol)) e.vols.set(x.vol,x);   // 同じ巻の別刷りは最初の1つでよい
-  });
-  return [...eds.values()]
-    .map(e=>({ak:e.ak, author:e.author, count:e.vols.size,
-              items:[...e.vols.values()].sort((a,b)=>a.vol-b.vol)}))
-    .sort((a,b)=>b.count-a.count);
+  const exact=cand.filter(x=>skey(x.series)===k||mkey(x.series)===mk
+                            ||(x.alt&&skey(x.alt)===k));
+  /* 副題ちがいの見出しからは、まだ無い巻だけを補う。
+     こうすると「電波教師」の1〜4巻を拾いつつ、
+     「オーバーロード : カッツェ平野の幽霊船」のような外伝が
+     本編の1・2巻を上書きしてしまうことがない。 */
+  const seen=new Set(exact.map(x=>x.vol));
+  const extra=cand.filter(x=>!exact.includes(x)&&mkey(x.series)===mk&&!seen.has(x.vol));
+  const eds=splitEditions(exact.concat(extra));
+  return eds.map(e=>{
+    const vols=new Map();
+    e.items.forEach(x=>{ if(!vols.has(x.vol)) vols.set(x.vol,x); });  // 同じ巻の別刷りは1つでよい
+    return {ak:e.ak, pk:e.pk, author:e.author, publisher:e.publisher,
+            label:edLabel(e), count:vols.size,
+            items:[...vols.values()].sort((a,b)=>a.vol-b.vol)};
+  }).sort((a,b)=>b.count-a.count);
 }
 /* 1本の巻リストが欲しい呼び出し向け。巻を最も多く持つ版を本編とみなすが、
    呼び出し側が著者を知っているとき（棚の束から探すとき）はその版に合わせる。
@@ -582,7 +595,7 @@ async function searchSeriesAll(name){
 async function searchSeries(name,prefer){
   const eds=await searchSeriesAll(name);
   if(!eds.length) return [];
-  const main=(prefer&&eds.find(e=>e.ak===prefer))||eds[0];
+  const main=(prefer&&(eds.find(e=>e.ak+'|'+e.pk===prefer)||eds.find(e=>e.ak===prefer)))||eds[0];
   const vols=new Map();
   [main,...eds.filter(e=>e!==main)].forEach(e=>
     e.items.forEach(x=>{ if(!vols.has(x.vol)) vols.set(x.vol,x); }));
@@ -617,19 +630,64 @@ async function add(isbn,opts){
    先頭の1人だけを取り、肩書きを落として比べる。 */
 const akey=s=>skey(String(s||'').split(/[、,\/／]/)[0]
   .replace(/\s*[／\/]?\s*(著|作|画|原作|イラスト|漫画)\s*$/,''));
+// 出版社の突き合わせ鍵。「[KADOKAWA]」のような角括弧や「株式会社」の飾りを落とす
+const pkey=s=>skey(String(s||'').replace(/[\[\]（）()]/g,'').replace(/^株式会社/,''));
+
+/* ══ 版（小説版／漫画版）の切り分け ══
+   同じ作品名・同じ著者でも、小説と漫画が別々に出ていることがある。
+   「超人高校生たちは異世界でも余裕で生き抜くようです!」は国会図書館が
+   漫画版でも原作者（海空りく）だけを返すので、著者では版を分けられない。
+   そこで出版社を見る——ただし「オーバーロード」のように
+   エンターブレイン→KADOKAWA と版元が変わっただけの作品を割ってはいけない。
+   巻番号が重なる（同じ巻が両方にある）ときにだけ、別の版と見なす。 */
+function splitEditions(items){
+  const byA=new Map();
+  items.forEach(x=>{ const a=akey(x.author||'');
+    if(!byA.has(a)) byA.set(a,[]);
+    byA.get(a).push(x); });
+  const out=[];
+  byA.forEach((list,a)=>{
+    const whole=()=>out.push({ak:a, pk:'', author:(list[0]||{}).author||'',
+                              publisher:'', items:list});
+    const byP=new Map();
+    list.forEach(x=>{ const p=pkey(x.publisher||'');
+      if(!byP.has(p)) byP.set(p,[]);
+      byP.get(p).push(x); });
+    if(byP.size<2) return whole();
+    const gs=[...byP.values()].map(l=>({l, vols:new Set(l.map(x=>x.vol))}));
+    let overlap=false;
+    for(let i=0;i<gs.length&&!overlap;i++)
+      for(let j=i+1;j<gs.length&&!overlap;j++)
+        if([...gs[i].vols].some(v=>gs[j].vols.has(v))) overlap=true;
+    if(!overlap) return whole();                 // 版元の引き継ぎ。1つの版として扱う
+    gs.forEach(g=>out.push({ak:a, pk:pkey(g.l[0].publisher||''),
+      author:g.l[0].author||'', publisher:g.l[0].publisher||'', items:g.l}));
+  });
+  return out;
+}
+// 版の呼び名。同じ著者で版が分かれたときは出版社で見分ける
+const edLabel=e=>(e.author||'').split(/[、,\/／]/)[0].trim()
+  +(e.publisher?`／${e.publisher}`:'');
 
 function build(list){
+  /* 束ねる鍵の題名は主題名（副題を落としたもの）にする。
+     「電波教師」と「電波教師 : HE IS A ULTIMATE TEACHER」は
+     国会図書館の見出しが違うだけで同じ作品なので、1つの棚に並べたい。 */
   const m=new Map();
   list.forEach(b=>{
-    const k=b.series?('S'+skey(b.series)+'|'+akey(b.author)):('B'+b.isbn);
-    if(!m.has(k)) m.set(k,{key:k,series:b.series,author:b.author||'',items:[]});
-    m.get(k).items.push(b);
+    const k=b.series?('S'+mkey(b.series)+'|'+akey(b.author)):('B'+b.isbn);
+    if(!m.has(k)) m.set(k,{key:k,series:mainTitle(b.series||''),author:b.author||'',items:[]});
+    const g=m.get(k);
+    g.items.push(b);
+    // 表示は短いほう（＝副題なし）を使う。「電波教師」と出したい
+    const t=mainTitle(b.series||'');
+    if(t&&t.length<g.series.length) g.series=t;
   });
   /* 著者が空の本（手入力など）は、同じ題名の束が1つだけならそこへ寄せる。
      2つ以上あるとどちらの版か決められないので、そのまま独立させる。 */
   const byTitle=new Map();
   m.forEach(g=>{ if(!g.series) return;
-    const t=skey(g.series);
+    const t=mkey(g.series);
     if(!byTitle.has(t)) byTitle.set(t,[]);
     byTitle.get(t).push(g); });
   byTitle.forEach(groups=>{
@@ -638,10 +696,29 @@ function build(list){
     if(named.length!==1||!blank.length) return;
     blank.forEach(g=>{ named[0].items.push(...g.items); m.delete(g.key); });
   });
-  const gs=[...m.values()];
+  /* 同じ著者名で小説版と漫画版が混ざっている束を割る。
+     国会図書館が漫画版でも原作者名だけを返す作品があり、
+     このまま1つの束にすると同じ巻が二重になって片方が見えなくなる。 */
+  const gs=[];
+  m.forEach(g=>{
+    if(!g.series){ gs.push(g); return; }
+    const eds=splitEditions(g.items);
+    if(eds.length<2){ gs.push(g); return; }
+    eds.forEach(e=>{
+      const sub=Object.assign({},g,{key:g.key+'|'+e.pk, items:e.items,
+        author:e.author, edition:e.publisher||''});
+      // 表示名は、その版が持つ最も短い見出しに合わせる
+      e.items.forEach(b=>{ const t2=mainTitle(b.series||'');
+        if(t2&&t2.length<sub.series.length) sub.series=t2; });
+      gs.push(sub);
+    });
+  });
   gs.forEach(g=>{
-    g.items.sort((a,b)=>(a.vol||0)-(b.vol||0));
-    g.by=new Map(g.items.filter(x=>x.vol).map(x=>[x.vol,x]));
+    g.items.sort((a,b)=>(a.vol||0)-(b.vol||0)||(a.added||0)-(b.added||0));
+    g.by=new Map(); g.extra=[];
+    // 同じ巻が2冊以上あるとき、はみ出したぶんは捨てずに持つ（棚から消えたように見えるため）
+    g.items.filter(x=>x.vol).forEach(x=>{
+      g.by.has(x.vol)?g.extra.push(x):g.by.set(x.vol,x); });
     g.max=Math.max(0,...g.by.keys());
     g.gaps=[]; g.want=[];
     if(g.series) for(let i=1;i<=g.max;i++){
@@ -654,10 +731,10 @@ function build(list){
     g.newest=Math.max(...g.items.map(x=>x.added||0));
     g.isSeries=!!g.series&&g.max>0;
   });
-  // 同じ題名の束が2つ以上あるときだけ、札に著者を添えて見分けられるようにする
+  // 同じ題名の束が2つ以上あるときだけ、札に著者や版元を添えて見分けられるようにする
   const cnt={};
-  gs.forEach(g=>{ if(g.series){ const t=skey(g.series); cnt[t]=(cnt[t]||0)+1; } });
-  gs.forEach(g=>{ g.dup=!!(g.series&&cnt[skey(g.series)]>1&&g.author); });
+  gs.forEach(g=>{ if(g.series){ const t=mkey(g.series); cnt[t]=(cnt[t]||0)+1; } });
+  gs.forEach(g=>{ g.dup=!!(g.series&&cnt[mkey(g.series)]>1&&(g.author||g.edition)); });
   return gs.sort((a,b)=>b.newest-a.newest);
 }
 
@@ -748,7 +825,8 @@ function render(){
         <div class="mini">${jacketImg(head,50,75)}</div>
         <div class="sbody">
           <div class="stitle">${esc(g.series)}</div>
-          <div class="ssub">${g.dup?esc(g.author.split(/[、,\/／]/)[0])+' · ':''}所持${g.have} / 最新${g.max}巻${
+          <div class="ssub">${g.dup?esc(g.author.split(/[、,\/／]/)[0]
+            +(g.edition?'／'+g.edition:''))+' · ':''}所持${g.have} / 最新${g.max}巻${
             isDone(g)?' · <span class="fin">完結</span>':''}${
             g.buy.length?` · <span class="miss">未所持 ${g.buy.join('、')}</span>`:''}</div>
           <div class="strip">${strip}</div>
@@ -1010,8 +1088,15 @@ function openSeries(key){
   }
   openWith(`
     <h2>${esc(g.series)}</h2>
-    <p class="meta">所持${g.have}冊 · 最新${g.max}巻${g.buy.length?` · 未所持 ${g.buy.join('、')}`:''}</p>
+    <p class="meta">${g.dup?esc(g.author.split(/[、,\/／]/)[0]
+      +(g.edition?'／'+g.edition:''))+' · ':''}所持${g.have}冊 · 最新${g.max}巻${
+      g.buy.length?` · 未所持 ${g.buy.join('、')}`:''}</p>
     <div class="covers" style="margin-top:12px">${covers}</div>
+    ${g.extra.length?`<div class="lab">同じ巻が重なっています</div>
+      <p class="meta">別の版か、版元違いの重版かもしれません。要らないほうは開いて棚から出せます。</p>
+      <div class="covers">${g.extra.map(b=>
+        `<button data-o="${b.isbn}"><div class="c ${b.own==='none'?'ghost':''}">${jacketImg(b)}</div>
+           <div class="num">${b.vol}</div></button>`).join('')}</div>`:''}
     <div class="menu">
       <button id="volpick">巻を足す（前の巻でも新刊でも、選んで入れる）</button>
       <button id="done"${isDone(g)?' class="on"':''}>${isDone(g)?'完結にしている':'完結にする'}</button>
@@ -1067,23 +1152,29 @@ async function volPicker(g,pre){
       : '<p class="meta" style="padding:12px 0">巻が見つかりませんでした。</p>';
     return;
   }
-  // 棚と同じ著者の版を既定にする
-  let ak=(eds.find(e=>e.ak===akey(g.author))||eds[0]).ak;
+  /* 棚のこの束と同じ版を既定にする。著者だけでなく版元も見る
+     （同じ著者名で小説版と漫画版が分かれることがある） */
+  const mineKey=akey(g.author)+'|'+pkey(g.edition||'');
+  let cur=eds.find(e=>e.ak+'|'+e.pk===mineKey)
+          ||eds.find(e=>e.ak===akey(g.author))||eds[0];
+  const ekey=e=>e.ak+'|'+e.pk;
   const sel=new Set(pre?[pre]:g.gaps);
   const draw=()=>{
-    const ed=eds.find(e=>e.ak===ak)||eds[0];
+    const ed=cur;
     /* 「持っている」の判定は版ごとに。小説1〜4巻を持っていても、
-       漫画版の1〜4巻はまだ持っていない（両方集める人がいる） */
-    const ownEd=ed.ak===akey(g.author);
+       漫画版の1〜4巻はまだ持っていない（両方集める人がいる）。
+       版元まで分かれている束では、版元も一致していなければ別の版として扱う。 */
+    const ownEd=g.edition?ekey(ed)===mineKey:ed.ak===akey(g.author);
     const has=x=>books.some(b=>b.isbn===x.isbn)||(ownEd&&g.by.has(x.vol));
     const avail=ed.items.filter(x=>!has(x));
     const availSet=new Set(avail.map(x=>x.vol));
     [...sel].forEach(v=>{ if(!availSet.has(v)) sel.delete(v); });
-    // 版が2つ以上あるときだけ、著者で選ばせる
-    const edChips=eds.filter(e=>e.ak&&e.count>=2).length>1
-      ? `<div class="chips" style="margin:6px 0 2px">`+eds.filter(e=>e.ak&&e.count>=2).map(e=>
-          `<button class="chip ${e.ak===ak?'on':''}" data-ed="${esc(e.ak)}">${
-            esc(e.author.split(/[、,\/／]/)[0])}（${e.count}巻）</button>`).join('')+`</div>`
+    // 版が2つ以上あるときだけ、どれを入れるか選ばせる
+    const multi=eds.filter(e=>e.ak&&e.count>=2);
+    const edChips=multi.length>1
+      ? `<div class="chips" style="margin:6px 0 2px">`+multi.map(e=>
+          `<button class="chip ${ekey(e)===ekey(ed)?'on':''}" data-ed="${esc(ekey(e))}">${
+            esc(e.label)}（${e.count}巻）</button>`).join('')+`</div>`
       : '';
     let chips='';
     ed.items.forEach(x=>{
@@ -1093,9 +1184,18 @@ async function volPicker(g,pre){
       }
       chips+=`<button class="v ${sel.has(x.vol)?'pick':'can'}" data-vol="${x.vol}">${x.vol}</button>`;
     });
+    /* 棚では抜けているのに、この版の記録に無い巻がある。
+       他の版なら見つかることがあるので、黙って隠さず伝える。 */
+    const edVols=new Set(ed.items.map(x=>x.vol));
+    const nowhere=g.gaps.filter(v=>!edVols.has(v));
+    const elsewhere=nowhere.filter(v=>eds.some(e2=>e2!==ed&&e2.items.some(x=>x.vol===v)));
     box.innerHTML=`<div class="lab">巻を選ぶ（見つかった${ed.count}巻・持っている巻は金）</div>`
       +edChips
       +`<div class="strip pickgrid" style="margin-top:6px">${chips}</div>`
+      +(nowhere.length?`<p class="meta" style="margin-top:8px">${
+        esc(nowhere.join('、'))}巻はこの版に見あたりません。${
+        elsewhere.length?`別の版（上のボタン）にあります。`
+          :'国会図書館にまだ記録が無いか、別の題名で入っているかもしれません。'}</p>`:'')
       +(avail.length?`<div class="chips" style="margin-top:8px">
           <button class="chip" id="selgap">抜けている巻だけ</button>
           <button class="chip" id="selall">全部</button>
@@ -1109,7 +1209,7 @@ async function volPicker(g,pre){
       const vb=e.target.closest('[data-vol]');
       if(vb){ const v=+vb.dataset.vol; sel.has(v)?sel.delete(v):sel.add(v); draw(); return; }
       const ec=e.target.closest('[data-ed]');
-      if(ec){ ak=ec.dataset.ed; draw(); return; }
+      if(ec){ cur=eds.find(x=>ekey(x)===ec.dataset.ed)||cur; draw(); return; }
       const ob=e.target.closest('#vpo [data-v]');
       if(ob){ addOwn=ob.dataset.v; draw(); return; }
       if(e.target.closest('#selgap')){ sel.clear(); g.gaps.forEach(v=>{ if(availSet.has(v)) sel.add(v); }); draw(); return; }
@@ -1229,7 +1329,7 @@ function openFind(q){
     try{ items=(await searchBooks(raw)).filter(x=>!books.some(b=>b.isbn===x.isbn)); }catch(e){}
     items=sortByVolume(items);
     box.innerHTML=items.length
-      ? `<div class="lab">検索結果</div>`+bulkBar(items)+results(items)
+      ? `<div class="lab">検索結果</div>`+bulkBar(items,raw)+results(items)
       : noHits(raw);
     wire(box,items,raw);
   };
@@ -1252,32 +1352,43 @@ function sortByVolume(items){
     .sort((a,b)=>a[0]-b[0]||a[1]-b[1]||a[2]-b[2]).map(z=>z[3]);
 }
 let bulkList=[];
-function bulkBar(items){
-  // 作品×著者（＝版）ごとに巻を束ねる。題名だけで束ねると小説と漫画が混ざる
-  const m=new Map();
+function bulkBar(items,q){
+  /* 作品（主題名）ごとにまとめ、その中を版（著者＋必要なら版元）で割る。
+     題名だけで束ねると小説と漫画が混ざる */
+  const byT=new Map();
   items.forEach(x=>{ const p=seriesOf(x); if(!p.vol) return;
-    const k=skey(p.series)+'|'+akey(x.author||'');
-    if(!m.has(k)) m.set(k,{sk:skey(p.series), ak:akey(x.author||''),
-                           author:x.author||'', vols:new Map()});
-    const g2=m.get(k);
-    if(!g2.vols.has(p.vol)) g2.vols.set(p.vol,x);
+    const t=mkey(p.series);
+    if(!byT.has(t)) byT.set(t,[]);
+    byT.get(t).push(Object.assign({},x,p));
   });
-  const groups=[...m.values()].sort((a,b)=>b.vols.size-a.vols.size);
-  const best=groups[0];
-  bulkList=(best&&best.vols.size>=2)
-    ? [...best.vols.values()].sort((a,b)=>seriesOf(a).vol-seriesOf(b).vol) : [];
+  /* まとめて入れるのは、探した題名そのものだけにする。
+     国会図書館は著者の別作品まで返してくるので（「幼女戦記」で
+     同じ作者の「売国機関」が来る）、巻数の多さだけで選ぶと
+     頼んでいない作品を丸ごと棚に入れてしまう。 */
+  const qk=q?mkey(q):'';
+  let best=null, sibs=[];
+  byT.forEach((list,t)=>{
+    if(!qk||t!==qk) return;
+    const eds=splitEditions(list).map(e=>{
+      const vols=new Map();
+      e.items.forEach(x=>{ if(!vols.has(x.vol)) vols.set(x.vol,x); });
+      return Object.assign({},e,{vols,count:vols.size});
+    }).sort((a,b)=>b.count-a.count);
+    if(!best||eds[0].count>best.count){ best=eds[0]; sibs=eds; }
+  });
+  bulkList=(best&&best.count>=2)
+    ? [...best.vols.values()].sort((a,b)=>a.vol-b.vol) : [];
   if(!bulkList.length) return '';
   // 同じ題名に版が2つ以上あるときは、どれを入れるか選ばせる
-  const sibs=groups.filter(g2=>g2.sk===best.sk&&g2.ak&&g2.vols.size>=2);
-  const edSel=sibs.length>1
-    ? `<div class="field" style="margin:8px 0 0"><select id="bed">${sibs.map(g2=>
-        `<option value="${esc(g2.ak)}"${g2===best?' selected':''}>${
-          esc(g2.author.split(/[、,\/／]/)[0])}（${g2.vols.size}巻）</option>`).join('')}
-        <option value="both">両方いれる</option></select></div>`
+  const multi=sibs.filter(e=>e.ak&&e.count>=2);
+  const edSel=multi.length>1
+    ? `<div class="field" style="margin:8px 0 0"><select id="bed">${multi.map(e=>
+        `<option value="${esc(e.ak+'|'+e.pk)}"${e===best?' selected':''}>${
+          esc(edLabel(e))}（${e.count}巻）</option>`).join('')}
+        <option value="both">全部いれる</option></select></div>`
     : '';
   /* 範囲は打たせずに選ばせる。「1-15」のような自由記述は読み違いのもと */
-  const vols=[...new Set(items.map(x=>seriesOf(x))
-    .filter(p=>p.vol&&skey(p.series)===best.sk).map(p=>p.vol))].sort((a,b)=>a-b);
+  const vols=[...new Set(bulkList.map(x=>x.vol))].sort((a,b)=>a-b);
   return edSel
     +`<div class="field" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0 0">
       <select id="bfrom">${vols.map(v=>`<option value="${v}">${v}</option>`).join('')}</select>
@@ -1432,7 +1543,7 @@ async function runBulkInput(){
     box.innerHTML=`<p class="meta" style="padding:10px 0">${esc(name)} を調べています（${i+1}/${lines.length}）…</p>`;
     let eds=[];
     try{ eds=await searchSeriesAll(name); }catch(e){}
-    bulkFound.push({i, name, range, eds, edSel:(eds[0]||{}).ak,
+    bulkFound.push({i, name, range, eds, edSel:eds[0]?eds[0].ak+'|'+eds[0].pk:null,
                     err:!eds.length&&!!lastError, dirty:false});
     await sleep(250);                       // 国会図書館に連打しない
   }
@@ -1442,10 +1553,10 @@ async function runBulkInput(){
     if(r.edSel==='both'){
       const m=new Map();
       r.eds.forEach(e=>e.items.forEach(x=>{
-        const kk=e.ak+'#'+x.vol; if(!m.has(kk)) m.set(kk,x); }));
+        const kk=e.ak+'|'+e.pk+'#'+x.vol; if(!m.has(kk)) m.set(kk,x); }));
       return [...m.values()].sort((a,b)=>a.vol-b.vol);
     }
-    const e=r.eds.find(e2=>e2.ak===r.edSel)||r.eds[0];
+    const e=r.eds.find(e2=>e2.ak+'|'+e2.pk===r.edSel)||r.eds[0];
     return e?e.items:[];
   };
   const rowHTML=r=>{
@@ -1455,9 +1566,9 @@ async function runBulkInput(){
     const multi=r.eds.filter(e=>e.ak&&e.count>=2);
     const edSel=multi.length>1
       ? `<div class="field" style="margin:2px 0 4px"><select data-be="${r.i}">${multi.map(e=>
-          `<option value="${esc(e.ak)}"${r.edSel===e.ak?' selected':''}>${
-            esc(e.author.split(/[、,\/／]/)[0])}（${e.count}巻）</option>`).join('')}
-          <option value="both"${r.edSel==='both'?' selected':''}>両方いれる</option></select></div>`
+          `<option value="${esc(e.ak+'|'+e.pk)}"${r.edSel===e.ak+'|'+e.pk?' selected':''}>${
+            esc(e.label)}（${e.count}巻）</option>`).join('')}
+          <option value="both"${r.edSel==='both'?' selected':''}>全部いれる</option></select></div>`
       : '';
     const items=itemsOf(r);
     const vols=[...new Set(items.map(x=>x.vol))].sort((a,b)=>a-b);
@@ -1551,7 +1662,7 @@ async function checkNew(){
     box.innerHTML=`<div class="lab">新刊を調べています</div>
       <p class="meta" style="padding:10px 0">${esc(g.series)}（${i+1}/${gs.length}）</p>`;
     let all=[];
-    try{ all=await searchSeries(g.series,akey(g.author)); }catch(e){ err=e; }
+    try{ all=await searchSeries(g.series,akey(g.author)+'|'+pkey(g.edition||'')); }catch(e){ err=e; }
     if(lastError) err=lastError;
     all.filter(x=>x.vol>g.max&&!books.some(b=>b.isbn===x.isbn))
        .forEach(x=>found.push(Object.assign({},x,{_series:g.series,_from:g.max})));
@@ -1673,10 +1784,10 @@ function wire(box,items,q,own){
       if(sel==='both'){
         const m=new Map();
         eds.forEach(e=>e.items.forEach(x=>{
-          const kk=e.ak+'#'+x.vol; if(!m.has(kk)) m.set(kk,x); }));
+          const kk=e.ak+'|'+e.pk+'#'+x.vol; if(!m.has(kk)) m.set(kk,x); }));
         list=[...m.values()].sort((a,b)=>a.vol-b.vol);
       }else if(sel){
-        const e=eds.find(x=>x.ak===sel); list=e?e.items:[];
+        const e=eds.find(x=>x.ak+'|'+x.pk===sel); list=e?e.items:[];
       }else if(eds.length){
         // 版の選択が無いときは従来どおり：主版＋足りない巻を他から補う
         const vols=new Map();
