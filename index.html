@@ -96,6 +96,9 @@ main{padding:14px 16px 130px}
 .ssub{font-size:11.5px;color:var(--dim);margin-top:2px;font-variant-numeric:tabular-nums}
 .ssub .miss{color:var(--alert);font-weight:700}
 .ssub .fin{color:var(--jade);font-weight:700}
+/* 新刊＝まだ棚に無い、所持より先の巻。買い逃しを金で目立たせる */
+.fresh{color:var(--foil);font-weight:700}
+.v.fresh{border:1px dashed var(--foil);color:var(--foil);font-weight:700}
 
 /* ══ 単巻グリッド ══ */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:15px 11px;align-items:end}
@@ -589,6 +592,42 @@ async function searchSeriesAll(name){
             items:[...vols.values()].sort((a,b)=>a.vol-b.vol)};
   }).sort((a,b)=>b.count-a.count);
 }
+/* ══ 外伝・スピンオフ ══
+   「オーバーロード」で調べると本編以外に
+   「オーバーロード不死者のOh!」「オーバーロード〈新〉世界編」
+   「オーバーロード公式コミックアラカルト」が出てくる。
+   同時に「オーバーロードの街」（神林長平）のような無関係な同名作品も来るので、
+   作品名が前に付いているだけでは足りない。本編の著者と1人でも重なるものを
+   「関連作品」として前に出し、そうでないものは「同じ名前の別作品」として後ろに置く。 */
+const authSet=s=>new Set(String(s||'').split(/[、,\/／]/)
+  .map(a=>skey(a.replace(/\s*(著|作|画|原作|イラスト|漫画)\s*$/,''))).filter(Boolean));
+async function searchRelated(name,author){
+  lastError=null;
+  const q=mainTitle(name), qk=skey(q);
+  let out=[];
+  try{ out=await ndlQuery({title:q,cnt:500}); }catch(e){ lastError=e; }
+  const mine=authSet(author);
+  const byT=new Map();
+  out.forEach(x=>{
+    const p=seriesOf(x), s=mainTitle(p.series||x.title||'');
+    const t=skey(s);
+    // 本編そのものは除く。作品名が前に付いているものだけを関連とみなす
+    if(!t||t===qk||t.indexOf(qk)!==0) return;
+    if(!byT.has(t)) byT.set(t,{title:s, items:[], auth:new Set()});
+    const g=byT.get(t);
+    g.items.push(Object.assign({},x,p));
+    authSet(x.author).forEach(a=>g.auth.add(a));
+  });
+  return [...byT.values()].map(g=>{
+    const vols=new Map();
+    g.items.forEach(x=>{ if(x.vol&&!vols.has(x.vol)) vols.set(x.vol,x); });
+    const shared=[...g.auth].some(a=>mine.has(a));
+    return {title:g.title, shared, count:vols.size||g.items.length,
+            author:(g.items[0]||{}).author||'',
+            items:vols.size?[...vols.values()].sort((a,b)=>a.vol-b.vol):g.items};
+  }).sort((a,b)=>(b.shared?1:0)-(a.shared?1:0)||b.count-a.count);
+}
+
 /* 1本の巻リストが欲しい呼び出し向け。巻を最も多く持つ版を本編とみなすが、
    呼び出し側が著者を知っているとき（棚の束から探すとき）はその版に合わせる。
    本編に無い巻は他の版から補う（従来と同じふるまい）。 */
@@ -773,9 +812,12 @@ function applySort(gs){
 
 function render(){
   const owned=books.filter(b=>b.own!=='none').length;
-  const buy=build(books).reduce((n,g)=>n+g.buy.length,0);
+  const all0=build(books);
+  const buy=all0.reduce((n,g)=>n+g.buy.length,0);
+  const fresh=all0.reduce((n,g)=>n+newOf(g).length,0);
   document.getElementById('stat').innerHTML=
-    `所持${owned} / 登録${books.length}`+(buy?` · <b>買う${buy}</b>`:'');
+    `所持${owned} / 登録${books.length}`+(buy?` · <b>買う${buy}</b>`:'')
+    +(fresh?` · <span class="fresh">新刊${fresh}</span>`:'');
   document.getElementById('chips').innerHTML=CHIPS.map(c=>
     `<button class="chip ${mode===c.id?'on':''}" data-m="${c.id}">${c.label}</button>`).join('');
   document.getElementById('sortbtn').textContent=sortLabel()+' ▾';
@@ -809,17 +851,20 @@ function render(){
   const series=applySort(gs.filter(g=>g.isSeries)), singles=applySort(gs.filter(g=>!g.isSeries));
   let html=(navigator.onLine===false
     ? `<div class="offline">オフラインです。棚は見られますが、検索と新刊の確認はできません</div>` : '')
-    + exportHint();
+    + newHint() + exportHint();
 
   if(series.length){
     html+=`<div class="h">シリーズ ${series.length}</div>`;
     series.forEach(g=>{
       const head=[...g.by.values()].pop()||g.items[0];
+      const nv=newOf(g);
       let strip='';
       for(let i=1;i<=g.max;i++){
         const b=g.by.get(i);
         strip+=b?`<span class="v ${vcls(b)}">${i}</span>`:`<span class="v gap">${i}</span>`;
       }
+      // 前回の新刊確認で見つかった、まだ棚に無い巻
+      nv.forEach(v=>{ strip+=`<span class="v fresh">${v}</span>`; });
       strip+=`<span class="v next">+</span>`;
       html+=`<button class="series ${g.buy.length?'buy':''}" data-g="${esc(g.key)}">
         <div class="mini">${jacketImg(head,50,75)}</div>
@@ -828,7 +873,8 @@ function render(){
           <div class="ssub">${g.dup?esc(g.author.split(/[、,\/／]/)[0]
             +(g.edition?'／'+g.edition:''))+' · ':''}所持${g.have} / 最新${g.max}巻${
             isDone(g)?' · <span class="fin">完結</span>':''}${
-            g.buy.length?` · <span class="miss">未所持 ${g.buy.join('、')}</span>`:''}</div>
+            g.buy.length?` · <span class="miss">未所持 ${g.buy.join('、')}</span>`:''}${
+            nv.length?` · <span class="fresh">新刊 ${nv.join('、')}</span>`:''}</div>
           <div class="strip">${strip}</div>
         </div></button>`;
     });
@@ -949,6 +995,7 @@ document.getElementById('chips').addEventListener('click',e=>{
 });
 document.getElementById('main').addEventListener('click',e=>{
   if(e.target.closest('#exphint')) return exportJSON();
+  if(e.target.closest('#newhint')){ openWith('<div class="lab">新刊</div>'); return checkNew(); }
   const s=e.target.closest('.series'); if(s) return openSeries(s.dataset.g);
   const b=e.target.closest('.book');   if(b) openBook(b.dataset.isbn);
 });
@@ -1099,6 +1146,7 @@ function openSeries(key){
            <div class="num">${b.vol}</div></button>`).join('')}</div>`:''}
     <div class="menu">
       <button id="volpick">巻を足す（前の巻でも新刊でも、選んで入れる）</button>
+      <button id="spinoff">外伝・スピンオフを探す</button>
       <button id="done"${isDone(g)?' class="on"':''}>${isDone(g)?'完結にしている':'完結にする'}</button>
     </div>
     <div id="found"></div>
@@ -1114,6 +1162,7 @@ function openSeries(key){
     <div class="seg" id="bown" style="margin-top:6px">${OWNS.map(o=>
       `<button data-v="${o.id}">${o.label}にする</button>`).join('')}</div>`);
   document.getElementById('volpick').onclick=()=>volPicker(g);
+  document.getElementById('spinoff').onclick=()=>spinoffs(g);
   document.getElementById('done').onclick=e=>{
     const on=toggleDone(g);
     e.currentTarget.classList.toggle('on',on);
@@ -1135,6 +1184,41 @@ function openSeries(key){
     bulkApply(g,upto(),b=>{b.own=t.dataset.v;},
       `1〜${upto()}巻を「${ownLabel(t.dataset.v)}」に`);
   };
+}
+
+/* ══ 外伝・スピンオフの一覧 ══
+   本編を棚に入れた人が次に探すのはたいてい外伝。
+   選べば、その作品の巻ピッカーがそのまま開く。 */
+async function spinoffs(g){
+  const box=document.getElementById('found');
+  box.innerHTML='<p class="meta" style="padding:12px 0">関連する作品を探しています…</p>';
+  let rel=[];
+  try{ rel=await searchRelated(g.series,g.author); }catch(e){}
+  if(!rel.length){
+    box.innerHTML=lastError
+      ? `<p class="meta" style="padding:12px 0;color:var(--alert)">${esc(errText(lastError))}。</p>`
+      : '<p class="meta" style="padding:12px 0">関連する作品は見つかりませんでした。</p>';
+    return;
+  }
+  const owned=t=>books.some(b=>mkey(b.series||b.title)===skey(t));
+  const row=r=>`<button class="hit" data-rel="${esc(r.title)}">
+    <div class="n">${esc(r.title)}${r.shared?'':'<em class="alt">別作者</em>'}
+      <small>${esc(r.author.split(/[、,\/／]/).slice(0,2).join('、'))}${
+        r.count>1?` / ${r.count}巻`:''}</small></div>
+    <span class="go ${owned(r.title)?'done':''}">${owned(r.title)?'棚にある':'見る'}</span></button>`;
+  const near=rel.filter(r=>r.shared), far=rel.filter(r=>!r.shared);
+  box.innerHTML=`<div class="lab">関連する作品</div>`+near.map(row).join('')
+    +(far.length?`<div class="lab">同じ名前の別作品</div>`+far.slice(0,6).map(row).join(''):'');
+  box.querySelectorAll('[data-rel]').forEach(el=>el.onclick=()=>{
+    const r=rel.find(x=>x.title===el.dataset.rel); if(!r) return;
+    // 棚にあるならその束を開き、無ければ「入れる前の束」に見せかけて巻を選ばせる
+    const g2=build(books).find(x=>x.series&&mkey(x.series)===skey(r.title));
+    if(g2) return openSeries(g2.key);
+    openWith(`<h2>${esc(r.title)}</h2>
+      <p class="meta">${esc(r.author)}</p><div id="found"></div>`);
+    volPicker({series:r.title, author:r.author, edition:'',
+               by:new Map(), gaps:[], max:0, key:null});
+  });
 }
 
 /* ══ 巻ピッカー ══
@@ -1223,7 +1307,10 @@ async function volPicker(g,pre){
         await save(); render();
         logAct('巻を追加',`${g.series}｜${n}冊｜${ownLabel(addOwn)}`);
         toast(`${n}冊を${ownLabel(addOwn)}で入れました`);
-        openSeries(g.key);                  // 所持数とストリップを引き直す
+        // 所持数とストリップを引き直す。外伝から入れたときは新しく出来た束を開く
+        const g2=g.key?build(books).find(x=>x.key===g.key)
+                     :build(books).find(x=>x.series&&mkey(x.series)===mkey(g.series));
+        if(g2) openSeries(g2.key); else closeSheet();
       }
     };
   };
@@ -1329,7 +1416,7 @@ function openFind(q){
     try{ items=(await searchBooks(raw)).filter(x=>!books.some(b=>b.isbn===x.isbn)); }catch(e){}
     items=sortByVolume(items);
     box.innerHTML=items.length
-      ? `<div class="lab">検索結果</div>`+bulkBar(items,raw)+results(items)
+      ? bulkBar(items,raw)+results(items,true,raw)
       : noHits(raw);
     wire(box,items,raw);
   };
@@ -1409,7 +1496,7 @@ function bulkBar(items,q){
    完結・並び順・書き出しの記録は books と同じ保存先（store）にまとめる。
    以前は localStorage 直書きで、書き出しにも含まれず機種変更で消えていた。 */
 const META='bookshelf:meta';
-let meta={done:[],sort:'added',dir:1,exportAt:0,exportN:0};
+let meta={done:[],sort:'added',dir:1,exportAt:0,exportN:0,newAt:0,newVols:{}};
 let doneKeys=new Set();
 async function loadMeta(){
   const m=await store.get(META);
@@ -1427,8 +1514,11 @@ async function loadMeta(){
 }
 function saveMeta(){
   meta.done=[...doneKeys]; meta.sort=sortBy; meta.dir=sortDir;
+  if(!meta.newVols||typeof meta.newVols!=='object') meta.newVols={};
   return store.set(META,meta);
 }
+// 前回調べたときに見つかっていた新刊。棚に入れたぶんは落とす
+const newOf=g=>(meta.newVols[gkey(g)]||[]).filter(v=>!g.by.has(v));
 /* ══ 操作の記録 ══
    何をいつ追加・削除・検索したかを端末の中だけに残す。
    不具合の再現手順を思い出せるように、また「よく使う流れ」を
@@ -1660,6 +1750,7 @@ async function checkNew(){
     return;
   }
   const found=[]; let err=null;
+  const hits={};
   for(let i=0;i<gs.length;i++){
     const g=gs[i];
     box.innerHTML=`<div class="lab">新刊を調べています</div>
@@ -1667,10 +1758,15 @@ async function checkNew(){
     let all=[];
     try{ all=await searchSeries(g.series,akey(g.author)+'|'+pkey(g.edition||'')); }catch(e){ err=e; }
     if(lastError) err=lastError;
-    all.filter(x=>x.vol>g.max&&!books.some(b=>b.isbn===x.isbn))
-       .forEach(x=>found.push(Object.assign({},x,{_series:g.series,_from:g.max})));
+    const mine=all.filter(x=>x.vol>g.max&&!books.some(b=>b.isbn===x.isbn));
+    if(mine.length) hits[gkey(g)]=[...new Set(mine.map(x=>x.vol))].sort((a,b)=>a-b);
+    mine.forEach(x=>found.push(Object.assign({},x,{_series:g.series,_from:g.max})));
     await sleep(250);                     // 国会図書館に連打しない
   }
+  /* 見つかった巻を棚に覚えさせる。押した本人がその場で買えるとは限らないので、
+     次に開いたときも札とストリップに出て、買い逃しに気づけるようにする。
+     書誌そのものは持ち越さない（固定化すると最新巻が古いまま嘘になる）。 */
+  if(!err){ meta.newVols=hits; meta.newAt=Date.now(); await saveMeta(); render(); }
   logAct('新刊確認',`${gs.length}作品｜新刊${found.length}件`);
   if(!found.length){
     box.innerHTML=`<div class="lab">新刊</div><p class="meta" style="padding:12px 0">`
@@ -1749,10 +1845,10 @@ async function addManual(title,own){
   return b;
 }
 
-function results(items){
+function results(items,grouped,q){
   // 同じ巻が複数版ある（通常版と特装版など）ときは、2件目以降にその旨を出す
   const seen=new Set();
-  return items.map((x,i)=>{
+  const one=(x,i)=>{
     const s=coverSrcs(x), p=seriesOf(x);
     const k=p.vol?skey(p.series)+'#'+p.vol:null;
     const dup=k&&seen.has(k); if(k) seen.add(k);
@@ -1762,7 +1858,35 @@ function results(items){
        :`<div class="ph"></div>`}
     <div class="n">${esc(x.title)}${dup?'<em class="alt">別版</em>':''}<small>${esc(x.author)}${
       x.date?' / '+esc(x.date.slice(0,4)):''}</small></div>
-    <button class="go" data-i="${i}">追加</button></div>`; }).join('');
+    <button class="go" data-i="${i}">追加</button></div>`;
+  };
+  if(!grouped) return items.map(one).join('');
+  /* 作品ごとに見出しでまとめる。まとめないと外伝やスピンオフが
+     本編の巻の海に埋もれて、あることに気づけない。 */
+  const byT=new Map();
+  items.forEach((x,i)=>{
+    const p=seriesOf(x), nm=mainTitle(p.series||x.title||''), t=skey(nm);
+    if(!byT.has(t)) byT.set(t,{name:nm||x.title, rows:[]});
+    byT.get(t).rows.push([x,i]);
+  });
+  /* 探した題名そのもの → その名前で始まる作品（外伝） → それ以外。
+     国会図書館は主題も見るので、「オーバーロード」で
+     「過重負担化するカリキュラム」まで返ってくる。同じ並びに混ぜない。 */
+  const qk=q?skey(mainTitle(q)):'';
+  const score=t=>!qk?1:(t===qk?0:t.indexOf(qk)===0?1:2);
+  const arr=[...byT.entries()].map(([t,g],i)=>({t,g,i}))
+    .sort((a,b)=>score(a.t)-score(b.t)||a.i-b.i);
+  let last=-1;
+  return arr.map(({t,g})=>{
+    const s=score(t);
+    const head=(qk&&s!==last)
+      ? (s===1?`<div class="h">この作品の外伝・関連</div>`
+        :s===2?`<div class="h">名前が似ているだけの本</div>`:'')
+      : '';
+    last=s;
+    return head+`<div class="lab">${esc(g.name)}${g.rows.length>1?`（${g.rows.length}冊）`:''}</div>`
+      + g.rows.map(([x,i])=>one(x,i)).join('');
+  }).join('');
 }
 function wire(box,items,q,own){
   const pick=()=>own||addOwn;                  // 呼び出し元が持ちかたを指定できる
@@ -2056,6 +2180,19 @@ const exportJSON=()=>{ dl(JSON.stringify({app:'bookshelf',version:3,
    棚は端末の中にしか無い。ブラウザのデータを消せば全部消える。
    書き出し機能があっても、きっかけが無いと押さないので、
    前回から離れたときだけ静かに促す。データを自動送信することはしない。 */
+/* ══ 新刊確認の促し ══
+   続きが出ていても、こちらから調べに行かないと分からない。
+   自動では通信しない（勝手に外へ繋ぐのは気持ちが悪いし、
+   国会図書館にも迷惑）。代わりに、間があいたときだけ静かに誘う。 */
+function newHint(){
+  const gs=build(books).filter(g=>g.isSeries&&!isDone(g));
+  if(!gs.length) return '';
+  const days=meta.newAt?Math.floor((Date.now()-meta.newAt)/86400000):999;
+  if(days<14) return '';
+  return `<button class="hint" id="newhint">${
+    meta.newAt?`新刊を調べてから${days}日たちました`:'続きが出ていないか、まだ調べていません'
+    }。${gs.length}作品を確かめませんか</button>`;
+}
 function exportHint(){
   if(!books.length) return '';
   const at=meta.exportAt;
