@@ -800,13 +800,18 @@ const openWith=h=>{
   sheetOpen=true; sheet.classList.add('on');
   try{ history.pushState({sh:1},''); }catch(e){}
 };
+/* history.back() は非同期で、popstate は後から届く。
+   閉じた直後に別のシートを開くと、その遅れて届いた popstate が
+   開いたばかりのシートを閉じてしまう。自分で戻したぶんは1回読み飛ばす。 */
+let ignorePop=0;
 const closeSheet=fromPop=>{
   if(!sheetOpen) return;
   sheetOpen=false; hid.on=false; sheet.classList.remove('on');
   // 戻るキー由来のときは、履歴はもう戻っているので二重に戻さない
-  if(!fromPop && history.state && history.state.sh) history.back();
+  if(!fromPop && history.state && history.state.sh){ ignorePop++; history.back(); }
 };
 window.addEventListener('popstate',()=>{
+  if(ignorePop>0){ ignorePop--; return; }
   if(sheetOpen) return closeSheet(true);
   if(document.getElementById('scanner').classList.contains('on')) stopScan(true);
 });
@@ -1469,7 +1474,7 @@ function stopScan(fromPop){
   if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
   document.getElementById('scanner').classList.remove('on');
   document.getElementById('hint').innerHTML='裏表紙の<b>上段</b>（978…）を枠に合わせてください';
-  if(!fromPop && history.state && history.state.sc) history.back();
+  if(!fromPop && history.state && history.state.sc){ ignorePop++; history.back(); }
 }
 document.getElementById('stop').onclick=()=>stopScan();
 
