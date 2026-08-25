@@ -1777,6 +1777,15 @@ function parseLine(line){
   return range ? {name:m[1].trim(), range} : {name:t, range:null};
 }
 const inRange=(v,r)=>!r ? true : (r.list ? r.list.has(v) : (v>=r.from&&v<=r.to));
+// 範囲を巻の一覧に開く（「1〜15」→ 1,2,…,15）
+const rangeVols=r=>r.list?[...r.list].sort((a,b)=>a-b)
+  :Array.from({length:Math.max(0,r.to-r.from+1)},(_,i)=>r.from+i);
+// 連続した巻は「1〜15」に圧縮して見せる
+const runs=vs=>{ const a=[...vs].sort((x,y)=>x-y), o=[];
+  for(let i=0;i<a.length;){ let j=i;
+    while(j+1<a.length&&a[j+1]===a[j]+1) j++;
+    o.push(i===j?String(a[i]):a[i]+'〜'+a[j]); i=j+1; }
+  return o.join('、'); };
 
 function openBulkInput(){
   openWith(`
@@ -1800,12 +1809,6 @@ function openBulkInput(){
   /* どう読み取られたかを打ちながら見せる。
      「1-5,8」の書き損じに、入れてしまってから気づくのでは遅い */
   const blines=document.getElementById('blines'), bprev=document.getElementById('bprev');
-  // 連続した巻は「1〜15」に圧縮して見せる
-  const runs=vs=>{ const a=[...vs].sort((x,y)=>x-y), o=[];
-    for(let i=0;i<a.length;){ let j=i;
-      while(j+1<a.length&&a[j+1]===a[j]+1) j++;
-      o.push(i===j?String(a[i]):a[i]+'〜'+a[j]); i=j+1; }
-    return o.join('、'); };
   blines.addEventListener('input',()=>{
     const lines=blines.value.split(/\r?\n/).map(parseLine).filter(Boolean);
     bprev.innerHTML=!lines.length?'':
@@ -1844,6 +1847,7 @@ async function runBulkInput(){
     const e=r.eds.find(e2=>e2.ak+'|'+e2.pk===r.edSel)||r.eds[0];
     return e?e.items:[];
   };
+  const edOf=r=>r.edSel==='both'?null:(r.eds.find(e2=>e2.ak+'|'+e2.pk===r.edSel)||r.eds[0]);
   const rowHTML=r=>{
     if(!r.eds.length) return `<div class="rows"><div class="r"><span>${esc(r.name)}</span>
       <span style="color:var(--alert)">${r.err?'通信が届きませんでした':'見つかりませんでした'}</span></div></div>`;
@@ -1860,9 +1864,26 @@ async function runBulkInput(){
     // 題名に書いた範囲は初期値として反映する
     const from=r.range?(r.range.list?Math.min(...r.range.list):r.range.from):vols[0];
     const to  =r.range?(r.range.list?Math.max(...r.range.list):r.range.to):null;
+    /* 書いた巻がこの版に無く、別の版にあることがある。
+       「よつばと!」は版元が移ってアスキー・メディアワークス版とKADOKAWA版に分かれ、
+       13巻以降は後者にしか無い。黙って「追加できる巻なし」で終わらせず、
+       どちらを選べばよいか伝える。 */
+    let note='';
+    const cur=edOf(r);
+    if(r.range&&cur&&r.eds.length>1){
+      const here=new Set(vols);
+      const miss=rangeVols(r.range).filter(v=>!here.has(v));
+      if(miss.length){
+        const alt=r.eds.filter(e=>e!==cur)
+          .map(e=>({e, n:miss.filter(v=>e.items.some(x=>x.vol===v)).length}))
+          .sort((a,b)=>b.n-a.n)[0];
+        if(alt&&alt.n) note=`<p class="meta" style="margin:0 0 4px">${
+          esc(runs(miss))}巻はこの版にありません。<b>${esc(alt.e.label)}</b>にあります（上で選べます）。</p>`;
+      }
+    }
     return `<div class="lab">${esc(items[0]&&items[0].series||r.name)}
         <span style="float:right" id="bn${r.i}"></span></div>`
-      +edSel
+      +edSel+note
       +`<div class="field" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <select data-bf="${r.i}">${vols.map(v=>
           `<option value="${v}"${v===from?' selected':''}>${v}</option>`).join('')}</select>
@@ -1976,18 +1997,25 @@ async function checkNew(force){
   /* 24時間以内に調べた作品は飛ばす。これで、429で中断しても次は残りから続けられる。
      「それでも全部」も選べるようにしておく（納得がいかないときの逃げ道） */
   const recent=g=>{ const m=seriesMeta(g); return !!m&&Date.now()-(m.checkedAt||0)<86400000; };
-  const gs=force?active:active.filter(g=>!recent(g));
+  /* その題名では国会図書館に1冊も無い（手で入れた本や、正式と違う題名）。
+     何度聞いても空振りなので、しばらく飛ばす */
+  const dead=g=>{ const m=seriesMeta(g); return !!m&&m.miss&&Date.now()-(m.checkedAt||0)<30*86400000; };
+  const gs=force?active.slice():active.filter(g=>!recent(g)&&!dead(g));
+  const nRecent=active.filter(g=>recent(g)).length;
+  const nDead=active.filter(g=>!recent(g)&&dead(g)).length;
   if(!gs.length){
     box.innerHTML=`<div class="lab">新刊</div>
-      <p class="meta" style="padding:12px 0">${active.length}作品とも、24時間以内に調べたばかりです。</p>
+      <p class="meta" style="padding:12px 0">${
+        nDead?`${nRecent}作品は24時間以内に調べたばかりで、${nDead}作品は国会図書館に記録がありません。`
+             :`${active.length}作品とも、24時間以内に調べたばかりです。`}</p>
       <button class="bulk" id="cnall">それでも全部調べ直す</button>`;
     document.getElementById('cnall').onclick=()=>checkNew(true);
     return;
   }
-  // 続きが出ていそうな作品（最近の刊行）から調べる。早い段階で結果が出る
+  // 続きが出ていそうな作品（最近の刊行）から調べる。早い段階で結果が出る。
+  // 刊行日を持たない本（手入力）は0になり、自然と後回しになる
   const lastDate=g=>Math.max(0,...g.items.map(b=>+((b.date||'')+'00').slice(0,6)||0));
   gs.sort((a,b)=>lastDate(b)-lastDate(a));
-  const carry=active.length-gs.length;         // 前回までに済んでいるぶん
 
   box.innerHTML=`<div class="lab">新刊を調べています</div>
     <p class="meta" id="cnprog" style="padding:10px 0">${esc(gs[0].series)}（1/${gs.length}）…</p>
@@ -2026,7 +2054,8 @@ async function checkNew(force){
     /* 1作品ごとに記録する。ここで残すから、途中で切れても成果が消えない。
        書誌そのものは持ち越さない（固定化すると最新巻が古いまま嘘になる）。 */
     meta.series[gkey(g)]={checkedAt:Date.now(),
-      newVols:[...new Set(mine.map(x=>x.vol))].sort((a,b)=>a-b)};
+      newVols:[...new Set(mine.map(x=>x.vol))].sort((a,b)=>a-b),
+      miss:!list.length};                      // 1冊も出てこない題名は次から飛ばす
     meta.newAt=Date.now();
     await saveMeta();
     if(mine.length){
@@ -2049,7 +2078,8 @@ async function checkNew(force){
       ? `${gs.length}作品を調べました。追加すると「未所持」で入ります。買ったら持ちかたを変えてください。`
       : `${gs.length}作品を調べました。新しい巻は見つかりませんでした。`
         +(skipped?`（完結の${skipped}作品は除く）`:'')
-        +(carry?`（24時間以内に調べた${carry}作品は除く）`:'');
+        +(!force&&nRecent?`（24時間以内に調べた${nRecent}作品は除く）`:'')
+        +(!force&&nDead?`（国会図書館に記録が無い${nDead}作品は除く）`:'');
   paint();
 }
 
@@ -2217,7 +2247,7 @@ function wire(box,items,q,own){
 }
 
 /* ══ スキャン ══ */
-let stream=null, loop=null, busy=false;
+let stream=null, loop=null, busy=false, camGot=[];
 const isSecure=()=>location.protocol==='https:'||['localhost','127.0.0.1'].includes(location.hostname);
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
@@ -2227,7 +2257,14 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
    カメラが使えない端末はこちらに回す。
    人の打鍵と区別するため、キーの間隔が短い数字の並びだけを拾う。 */
 const HID_GAP=120;                       // これより間が空いたら人の入力とみなして捨てる
-let hid={buf:'',t:0,on:false,n:0};
+let hid={buf:'',t:0,on:false,n:0,got:[]};
+/* 読んだ本の表紙は、1冊ずつ Amazon を当てずっぽうに引くより
+   openBD へまとめて聞くほうが速い。読み終わり（手が止まった頃）に1回だけ投げる。 */
+let scanCovT=0;
+function scanCovers(list){
+  clearTimeout(scanCovT);
+  scanCovT=setTimeout(()=>fillCoversFor(list.splice(0)),2500);
+}
 document.addEventListener('keydown',e=>{
   if(!hid.on) return;
   const tag=(e.target&&e.target.tagName)||'';
@@ -2256,11 +2293,12 @@ async function hidAdd(code){
   if(!isISBN13(code)){ row(`ISBN として正しくありません（${code}）`,'ng'); return; }
   if(books.some(b=>b.isbn===code)){ row('もう棚にあります','ng'); return; }
   const b=await add(code,{own:addOwn,quiet:true});
-  if(b){ hid.n++; row(b.title,'ok'); } else row(`見つかりませんでした（${code}）`,'ng');
+  if(b){ hid.n++; row(b.title,'ok'); hid.got.push(b); scanCovers(hid.got); }
+  else row(`見つかりませんでした（${code}）`,'ng');
 }
 
 function openScanUSB(){
-  hid={buf:'',t:0,on:true,n:0};
+  hid={buf:'',t:0,on:true,n:0,got:[]};
   openWith(`
     <h2>連続スキャン</h2>
     <p class="meta">USBバーコードリーダーで、裏表紙の <b>978</b> で始まる方を続けて読ませてください。
@@ -2290,7 +2328,7 @@ document.getElementById('scan').onclick=async()=>{
   }catch(e){ toast('カメラを使う許可が必要です',true); return; }
   video.srcObject=stream; await video.play();
   document.getElementById('scanner').classList.add('on');
-  document.getElementById('log').innerHTML='';
+  document.getElementById('log').innerHTML=''; camGot=[];
   try{ history.pushState({sc:1},''); }catch(e){}   // 戻るキーで閉じられるようにする
 
   const det=new BarcodeDetector({formats:['ean_13']});
@@ -2308,7 +2346,7 @@ document.getElementById('scan').onclick=async()=>{
             pushLog('すでに棚にあります');
           }else{
             const b=await add(v,{own:'paper',quiet:true});
-            if(b) pushLog(b.series?`${b.series} ${b.vol}`:b.title);
+            if(b){ pushLog(b.series?`${b.series} ${b.vol}`:b.title); camGot.push(b); }
             else  pushLog('情報が見つかりません（'+v+'）');
           }
           await sleep(1000);
@@ -2329,6 +2367,8 @@ function pushLog(t){
 function stopScan(fromPop){
   clearInterval(loop); loop=null;
   if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
+  // 読んだぶんの表紙は、閉じたところでまとめて1回聞く
+  if(camGot.length) fillCoversFor(camGot.splice(0));
   document.getElementById('scanner').classList.remove('on');
   document.getElementById('hint').innerHTML='裏表紙の<b>上段</b>（978…）を枠に合わせてください';
   if(!fromPop && history.state && history.state.sc){ ignorePop++; history.back(); }
