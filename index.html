@@ -334,7 +334,15 @@ const store={
     try{
       if(window.storage){ await window.storage.set(k,s); return; }
       localStorage.setItem(k,s);
-    }catch(e){ if(!quiet) toast('保存できませんでした',true); }   // 検索の控えの保存失敗は騒がない
+    }catch(e){
+      /* 置き場所が足りないのなら、まず検索の控えを捨てて場所を空ける。
+         棚そのものより控えのほうが失って構わないのに、
+         先に場所を取っていたせいで大事なほうが負ける、を防ぐ */
+      if(!quiet&&k!==QKEY&&dropQCache()){
+        try{ localStorage.setItem(k,s); return; }catch(e2){}
+      }
+      if(!quiet) toast('保存できませんでした',true);   // 検索の控えの保存失敗は騒がない
+    }
   }
 };
 // 保存＝棚が変わった印。束ねの計算結果（build のメモ）はここで捨てる
@@ -504,6 +512,14 @@ async function qload(){
   }
   return qdisk;
 }
+// 置き場所が足りないときの逃がし弁。控えは捨ててよい（次に引き直せばいい）
+function dropQCache(){
+  clearTimeout(qdiskT);
+  const had=qdisk&&Object.keys(qdisk).length;
+  qdisk={};
+  try{ localStorage.removeItem(QKEY); }catch(e){}
+  return !!had;
+}
 function qsave(){
   clearTimeout(qdiskT);
   qdiskT=setTimeout(()=>{
@@ -526,7 +542,15 @@ async function ndlQuery(p){
     const dk=qd[u];
     if(dk&&Date.now()-dk.t<(p.isbn?2592000000:21600000)) return dk.items;
   }
-  const job=ndlFetch(u).then(items=>{ qd[u]={t:Date.now(),items}; qsave(); return items; });
+  const job=ndlFetch(u).then(items=>{
+    /* 端末に残すのは「大きく引いて実際に当たった」応答だけ。
+       0件を残すと、NDLが一時的に不調で 200＋空を返したときに
+       「見つかりませんでした」が6時間固定されてしまう。
+       打鍵ごとのサジェスト（cnt=25）も残さない——数が多く、
+       古い順の間引きで肝心の全巻リスト（cnt=500）を押し流す。 */
+    if(items.length&&(p.cnt||200)>=200){ qd[u]={t:Date.now(),items}; qsave(); }
+    return items;
+  });
   qcache.set(u,{t:Date.now(),p:job});
   try{ return await job; }
   catch(e){
@@ -1087,6 +1111,7 @@ const sheet=document.getElementById('sheet'), card=document.getElementById('card
    開くときに履歴を1つ積み、閉じるときに戻す。 */
 let sheetOpen=false;
 const openWith=h=>{
+  bulkSeq++; checkSeq++;     // 別の画面へ移ったら、裏で続いている調査は降ろす
   card.innerHTML=h; card.scrollTop=0;
   if(sheetOpen) return;
   sheetOpen=true; sheet.classList.add('on');
@@ -1098,7 +1123,7 @@ const openWith=h=>{
 let ignorePop=0;
 const closeSheet=fromPop=>{
   if(!sheetOpen) return;
-  sheetOpen=false; hid.on=false; sheet.classList.remove('on');
+  sheetOpen=false; hid.on=false; bulkSeq++; checkSeq++; sheet.classList.remove('on');
   // 戻るキー由来のときは、履歴はもう戻っているので二重に戻さない
   if(!fromPop && history.state && history.state.sh){ ignorePop++; history.back(); }
 };
@@ -1658,7 +1683,10 @@ function bulkBar(items,q){
    完結・並び順・書き出しの記録は books と同じ保存先（store）にまとめる。
    以前は localStorage 直書きで、書き出しにも含まれず機種変更で消えていた。 */
 const META='bookshelf:meta';
-let meta={done:[],sort:'added',dir:1,exportAt:0,exportN:0,newAt:0,newVols:{}};
+/* series: 作品ごとの新刊確認の記録 {gkey:{checkedAt, newVols:[]}}。
+   以前は全体で1つの newVols/newAt しか持たず、途中で429に当たると
+   それまでの成果が丸ごと捨てられ、次も最初から全作品を調べ直していた。 */
+let meta={done:[],sort:'added',dir:1,exportAt:0,exportN:0,newAt:0,newVols:{},series:{}};
 let doneKeys=new Set();
 // 読み込み済みの値を受け取る形にして、起動時に books と並列で読めるようにする
 function loadMeta(m){
@@ -1673,14 +1701,21 @@ function loadMeta(m){
   doneKeys=new Set(Array.isArray(meta.done)?meta.done:[]);
   if(SORTS.some(x=>x.id===meta.sort)) sortBy=meta.sort;
   sortDir=meta.dir===-1?-1:1;
+  if(!meta.series||typeof meta.series!=='object'||Array.isArray(meta.series)) meta.series={};
+  // 旧形式（全体で1つの newVols）からの引き継ぎ。調べた時刻は全体の newAt を充てる
+  if(!Object.keys(meta.series).length&&meta.newVols&&typeof meta.newVols==='object'){
+    Object.keys(meta.newVols).forEach(k=>{
+      meta.series[k]={checkedAt:meta.newAt||0, newVols:meta.newVols[k]||[]}; });
+  }
 }
 function saveMeta(){
   meta.done=[...doneKeys]; meta.sort=sortBy; meta.dir=sortDir;
-  if(!meta.newVols||typeof meta.newVols!=='object') meta.newVols={};
+  if(!meta.series||typeof meta.series!=='object') meta.series={};
   return store.set(META,meta);
 }
+const seriesMeta=g=>{ const m=meta.series[gkey(g)]; return (m&&typeof m==='object')?m:null; };
 // 前回調べたときに見つかっていた新刊。棚に入れたぶんは落とす
-const newOf=g=>(meta.newVols[gkey(g)]||[]).filter(v=>!g.by.has(v));
+const newOf=g=>((seriesMeta(g)||{}).newVols||[]).filter(v=>!g.by.has(v));
 /* ══ 操作の記録 ══
    何をいつ追加・削除・検索したかを端末の中だけに残す。
    不具合の再現手順を思い出せるように、また「よく使う流れ」を
@@ -1788,8 +1823,9 @@ function openBulkInput(){
 /* 2段階にする。まず全作品を調べて「見つかった巻」を出し、
    範囲はプルダウンで選んでから棚に入れる。自由記述の読み違いで
    入れてしまう事故を、選ばせることで潰す。 */
-let bulkFound=[];
+let bulkFound=[], bulkSeq=0;
 async function runBulkInput(){
+  const seq=++bulkSeq;      // 調べ直し・画面を閉じたときに、古い走査を黙って降ろすための世代
   const box=document.getElementById('bres');
   const go=document.getElementById('bgo');
   const lines=document.getElementById('blines').value.split(/\r?\n/)
@@ -1895,10 +1931,12 @@ async function runBulkInput(){
   // ここから調査。配線を先に済ませてあるので、行が埋まった端から触れる
   const t0=performance.now();
   for(let i=0;i<lines.length;i++){
+    if(seq!==bulkSeq) return;                      // 調べ直しが始まっている。この走査は降りる
     const {name,range}=lines[i];
     const tq=performance.now();
     let eds=[];
     try{ eds=await searchSeriesAll(name); }catch(e){}
+    if(seq!==bulkSeq) return;                      // 待っている間に世代が変わった
     const r={i, name, range, eds, edSel:eds[0]?eds[0].ak+'|'+eds[0].pk:null,
              err:!eds.length&&!!lastError, dirty:false};
     bulkFound.push(r);
@@ -1922,53 +1960,97 @@ async function runBulkInput(){
    棚のシリーズを国会図書館に問い合わせ、所持最大巻より先に実在する巻を出す。
    結果は保存しない。持ち越すと「最新巻」が古いまま固定されて、
    抜け巻検出そのものが嘘になるため、押すたびに引き直す。 */
-async function checkNew(){
+let checkSeq=0;
+async function checkNew(force){
+  const seq=++checkSeq;                        // 画面を離れたら走査を降ろすための世代
   const box=document.getElementById('card');
   const all=build(books).filter(g=>g.isSeries);
-  const gs=all.filter(g=>!isDone(g));          // 完結にした作品は追いかけない
-  const skipped=all.length-gs.length;
-  if(!gs.length){
+  const active=all.filter(g=>!isDone(g));      // 完結にした作品は追いかけない
+  const skipped=all.length-active.length;
+  if(!active.length){
     box.innerHTML=`<p class="meta" style="padding:12px 0">`
       +(all.length?`調べる作品がありません（${skipped}作品は完結にしています）。`
                   :'シリーズがまだありません。')+'</p>';
     return;
   }
-  const found=[]; let err=null;
-  const hits={};
-  const t0=performance.now();
-  for(let i=0;i<gs.length;i++){
-    const g=gs[i];
-    box.innerHTML=`<div class="lab">新刊を調べています</div>
-      <p class="meta" style="padding:10px 0">${esc(g.series)}（${i+1}/${gs.length}）</p>`;
-    let all=[];
-    // fresh: 新刊の有無だけはキャッシュを信じず、必ず引き直す
-    try{ all=await searchSeries(g.series,akey(g.author)+'|'+pkey(g.edition||''),true); }catch(e){ err=e; }
-    if(lastError) err=lastError;
-    const mine=all.filter(x=>x.vol>g.max&&!books.some(b=>b.isbn===x.isbn));
-    if(mine.length) hits[gkey(g)]=[...new Set(mine.map(x=>x.vol))].sort((a,b)=>a-b);
-    mine.forEach(x=>found.push(Object.assign({},x,{_series:g.series,_from:g.max})));
-    await sleep(250);                     // 国会図書館に連打しない
-  }
-  /* 見つかった巻を棚に覚えさせる。押した本人がその場で買えるとは限らないので、
-     次に開いたときも札とストリップに出て、買い逃しに気づけるようにする。
-     書誌そのものは持ち越さない（固定化すると最新巻が古いまま嘘になる）。 */
-  if(!err){ meta.newVols=hits; meta.newAt=Date.now(); await saveMeta(); render(); }
-  logAct('新刊確認',`${gs.length}作品｜新刊${found.length}件`,performance.now()-t0);
-  if(!found.length){
-    box.innerHTML=`<div class="lab">新刊</div><p class="meta" style="padding:12px 0">`
-      +(err?`調べきれませんでした。${errText(err)}。`
-           :`${gs.length}作品を調べました。新しい巻は見つかりませんでした。`
-            +(skipped?`（完結の${skipped}作品は除く）`:''))
-      +`</p>`;
+  /* 24時間以内に調べた作品は飛ばす。これで、429で中断しても次は残りから続けられる。
+     「それでも全部」も選べるようにしておく（納得がいかないときの逃げ道） */
+  const recent=g=>{ const m=seriesMeta(g); return !!m&&Date.now()-(m.checkedAt||0)<86400000; };
+  const gs=force?active:active.filter(g=>!recent(g));
+  if(!gs.length){
+    box.innerHTML=`<div class="lab">新刊</div>
+      <p class="meta" style="padding:12px 0">${active.length}作品とも、24時間以内に調べたばかりです。</p>
+      <button class="bulk" id="cnall">それでも全部調べ直す</button>`;
+    document.getElementById('cnall').onclick=()=>checkNew(true);
     return;
   }
-  found.sort((a,b)=>a._series.localeCompare(b._series)||a.vol-b.vol);
-  const names=[...new Set(found.map(x=>`${x._series}（${x._from}巻まで所持）`))];
-  box.innerHTML=`<div class="lab">続きが出ています</div>`
-    + names.map(n=>`<p class="meta" style="margin:0">${esc(n)}</p>`).join('')
-    + results(found)
-    + `<p class="meta" style="margin-top:10px">追加すると「未所持」で入ります。買ったら持ちかたを変えてください。</p>`;
-  wire(box,found,'','none');       // 新刊はまだ持っていないので既定を「未所持」にする
+  // 続きが出ていそうな作品（最近の刊行）から調べる。早い段階で結果が出る
+  const lastDate=g=>Math.max(0,...g.items.map(b=>+((b.date||'')+'00').slice(0,6)||0));
+  gs.sort((a,b)=>lastDate(b)-lastDate(a));
+  const carry=active.length-gs.length;         // 前回までに済んでいるぶん
+
+  box.innerHTML=`<div class="lab">新刊を調べています</div>
+    <p class="meta" id="cnprog" style="padding:10px 0">${esc(gs[0].series)}（1/${gs.length}）…</p>
+    <div id="cnfound"></div>`;
+  const found=[]; let err=null, ng=0, stopped=false;
+  const t0=performance.now();
+  /* 見つかるたびに出す。総時間は変わらないが、待っている間に結果が見え、
+     その場で追加もできる。追加した巻は次の描き直しで一覧から消える */
+  const paint=()=>{
+    const live=found.filter(x=>!books.some(b=>b.isbn===x.isbn));
+    const fbox=document.getElementById('cnfound');
+    if(!fbox) return;
+    fbox.innerHTML=live.length?`<div class="lab">続きが出ています</div>`+results(live):'';
+    wire(fbox,live,'','none');                 // 新刊はまだ持っていないので既定を「未所持」に
+  };
+  for(let i=0;i<gs.length;i++){
+    if(seq!==checkSeq) return;                 // 別の画面へ移った。静かに降りる
+    const g=gs[i];
+    const prog=document.getElementById('cnprog');
+    if(prog) prog.textContent=`${g.series}（${i+1}/${gs.length}）…`;
+    let list=[], e0=null;
+    // fresh: 新刊の有無だけはキャッシュを信じず、必ず引き直す
+    try{ list=await searchSeries(g.series,akey(g.author)+'|'+pkey(g.edition||''),true); }catch(e){ e0=e; }
+    if(seq!==checkSeq) return;
+    if(lastError) e0=lastError;
+    if(e0){
+      /* 断られたら間を空けて次へ。3作品続けて失敗したら、そこで切り上げる。
+         叩き続けても通らないうえ、迷惑をかける */
+      err=e0; ng++;
+      if(ng>=3){ stopped=true; break; }
+      await sleep(ng*5000);
+      continue;
+    }
+    ng=0;
+    const mine=list.filter(x=>x.vol>g.max&&!books.some(b=>b.isbn===x.isbn));
+    /* 1作品ごとに記録する。ここで残すから、途中で切れても成果が消えない。
+       書誌そのものは持ち越さない（固定化すると最新巻が古いまま嘘になる）。 */
+    meta.series[gkey(g)]={checkedAt:Date.now(),
+      newVols:[...new Set(mine.map(x=>x.vol))].sort((a,b)=>a-b)};
+    meta.newAt=Date.now();
+    await saveMeta();
+    if(mine.length){
+      mine.forEach(x=>found.push(Object.assign({},x,{_series:g.series,_from:g.max})));
+      found.sort((a,b)=>a._series.localeCompare(b._series)||a.vol-b.vol);
+      paint();
+    }
+    if(i<gs.length-1) await sleep(250);        // 国会図書館に連打しない
+  }
+  if(seq!==checkSeq) return;
+  render();
+  logAct('新刊確認',`${gs.length}作品｜新刊${found.length}件`+(stopped?'｜中断':''),performance.now()-t0);
+  const head=document.querySelector('#card .lab');
+  if(head) head.textContent='新刊';
+  const prog=document.getElementById('cnprog');
+  if(prog) prog.innerHTML=stopped
+    ? `<span style="color:var(--alert)">${esc(errText(err))}。</span>
+       ここまでの結果は残しました。時間をおいてもう一度押すと、調べていない作品から続けます。`
+    : found.length
+      ? `${gs.length}作品を調べました。追加すると「未所持」で入ります。買ったら持ちかたを変えてください。`
+      : `${gs.length}作品を調べました。新しい巻は見つかりませんでした。`
+        +(skipped?`（完結の${skipped}作品は除く）`:'')
+        +(carry?`（24時間以内に調べた${carry}作品は除く）`:'');
+  paint();
 }
 
 // 0件だったのか、そもそも届かなかったのか。利用者にはこの区別が要る
@@ -2469,11 +2551,14 @@ const exportJSON=()=>{ dl(JSON.stringify({app:'bookshelf',version:3,
 function newHint(){
   const gs=build(books).filter(g=>g.isSeries&&!isDone(g));
   if(!gs.length) return '';
-  const days=meta.newAt?Math.floor((Date.now()-meta.newAt)/86400000):999;
-  if(days<14) return '';
+  // 作品ごとに「いつ調べたか」を持つようになったので、放置しているぶんだけを数える
+  const stale=gs.filter(g=>{ const m=seriesMeta(g);
+    return !m||Date.now()-(m.checkedAt||0)>=14*86400000; });
+  if(!stale.length) return '';
   return `<button class="hint" id="newhint">${
-    meta.newAt?`新刊を調べてから${days}日たちました`:'続きが出ていないか、まだ調べていません'
-    }。${gs.length}作品を確かめませんか</button>`;
+    meta.newAt?`${stale.length}作品は、2週間以上あたらしい巻を調べていません`
+              :`続きが出ていないか、まだ調べていません（${stale.length}作品）`
+    }。確かめませんか</button>`;
 }
 function exportHint(){
   if(!books.length) return '';

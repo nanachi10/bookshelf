@@ -45,8 +45,9 @@ GitHub Pages（github.com/nanachi10/bookshelf）で公開し、利用者はス�
 | キー | 中身 |
 |------|------|
 | `bookshelf:v3` | books 配列（本体） |
-| `bookshelf:meta` | 完結の印・並び順・書き出し記録・新刊記録 `{done:[], sort, dir, exportAt, exportN, newAt, newVols:{}}` |
-| `bookshelf:log` | 操作の記録（端末内のみ・直近500件） |
+| `bookshelf:meta` | 完結の印・並び順・書き出し記録・新刊記録 `{done:[], sort, dir, exportAt, exportN, newAt, series:{}}`。`series` は作品ごとの新刊確認 `{gkey:{checkedAt,newVols:[]}}`（旧 `newVols` は起動時に自動移行） |
+| `bookshelf:log` | 操作の記録（端末内のみ・直近500件。`ms` があれば所要時間） |
+| `bookshelf:qcache` | 国会図書館の応答の控え。捨ててよい（§6の性能まわり参照） |
 | `bookshelf:v3:broken` 等 | JSON解析に失敗した生データの退避先（消さない。復旧の手がかり） |
 | `bookshelf:v1` / `v2` | 旧形式。起動時に自動移行 |
 
@@ -108,6 +109,25 @@ GitHub Pages（github.com/nanachi10/bookshelf）で公開し、利用者はス�
 - **書影**: NDLはReferer制限で他所から403。Amazon→Google の順。
   「表紙なし」は404ではなく**200で代替画像**が返る（Amazon=1x1、Google=128x170）ため寸法で見分ける。
 
+## 6.5 性能まわりの仕組み（2026-08-25 に追加。触るときは意図を壊さないこと）
+
+- **クエリの控え**（`bookshelf:qcache`）: `ndlQuery` が応答を端末に残す。ISBN照会30日／検索6時間、
+  上限約1.5MB（古い順に間引き）。**0件の応答と cnt<200 の小さいクエリは残さない**
+  （不調時の空振りが固定化するのと、サジェストが全巻リストを押し流すのを防ぐため）。
+  通信失敗時は期限切れの控えでしのぐ（stale-if-error）。**`fresh:true` で完全バイパス**——
+  新刊チェックだけがこれを使い、キャッシュ由来の見逃しを構造的に防いでいる。
+  保存が容量不足で失敗したら、控えを捨てて棚本体の保存を優先する（`dropQCache`）。
+- **世代カウンタ** `bulkSeq` / `checkSeq`: まとめて入力と新刊チェックの走査は、
+  `openWith` / `closeSheet` で世代が進むと次の反復で自分から降りる。画面を離れたのに
+  裏で国会図書館を叩き続けないための仕組み。長い走査を足すときは同じ作法で。
+- **新刊チェックは作品ごとに記録して途中で保存する**（`meta.series[gkey]`）。24時間以内に
+  調べた作品は飛ばすので、中断しても再実行は残りだけ。3作品連続の失敗で中断（5秒→10秒の待ち）。
+- **表紙**: 表示に成功したURLは `b.cover` に書き戻す（`ckCover`）。まとめて追加の直後は
+  `fillCoversFor` が openBD へ1回だけ一括照会する。メニューの「表紙を補う」は棚全体版。
+- **描画**: `build()` はメモ化され、`save()` で捨てられる（棚を書き換えたら必ず `save()` を通すこと。
+  直接 `books` をいじって `render()` だけ呼ぶと古い束ねが出る）。絞り込みは150msデバウンス。
+- **計測**: `logAct(type, detail, ms)` の第3引数。主要な操作の所要時間が「操作の記録」に残る。
+
 ## 7. JSとDOMの契約（見た目を変える人へ）
 
 CSSのデザインは自由に変えてよい。ただし以下はJSが依存する契約なので**維持する**こと。
@@ -141,6 +161,13 @@ CSSのデザインは自由に変えてよい。ただし以下はJSが依存す
 
 `.on`（選択中） `.buy` `.ghost` `.done` `.pick` `.can` `.kill` `.fresh` `.warn` `.act`
 巻ストリップの `.v` ＋ `paper/digital/none/gap/next/read/anime`、ピンの `.read/.now/.anime`
+`main.still`（2回目以降の描画。出現アニメを止める印）
+
+### 7.4.1 機能CSS（削除・上書き禁止。見た目ではなく性能のための数行）
+
+`.series` / `.book` の `content-visibility:auto` と `contain-intrinsic-size`（画面外の描画を省く）、
+`main.still .series, main.still .book { animation:none }`（再描画のたびに全カードが跳ねるのを防ぐ）。
+デザインを入れ替えるときも、この2つのルールは残すこと。
 
 ### 7.5 querySelector で拾われるクラス
 
@@ -157,10 +184,8 @@ CSSのデザインは自由に変えてよい。ただし以下はJSが依存す
 
 ## 8. 開発の回しかた
 
-1. ローカル確認: 静的サーバならなんでもよい（ポート8123を使ってきた）。
-   **注意**: `.claude/launch.json` の `runtimeArgs` は過去セッションの一時ディレクトリの server.js を
-   指しており、消えていたら動かない。その場合は新しい scratchpad に数行の server.js を作り直して
-   launch.json のパスを更新する。
+1. ローカル確認: `node dev-server.js` → http://localhost:8123 （`.claude/launch.json` も同じものを使う）。
+   dev-server.js は開発専用でアプリ本体とは無関係。GitHub Pages には影響しない。
 2. 動作検証: ブラウザプレビューで JS からシードデータを投入して実測。利用者側の調査は
    「操作の記録」（メニュー→操作の記録→JSONで書き出す）を見せてもらう手がある。
 3. カメラ検証は https か localhost のみ（getUserMedia の制約）。

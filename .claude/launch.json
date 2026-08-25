@@ -4,7 +4,7 @@
     {
       "name": "bookshelf",
       "runtimeExecutable": "node",
-      "runtimeArgs": ["C:/Users/S31402/AppData/Local/Temp/claude/C--Users-S31402-Documents-GitHub-bookshelf/75ea85ca-3c25-48cf-8be9-f602e324a6fa/scratchpad/server.js"],
+      "runtimeArgs": ["dev-server.js"],
       "port": 8123
     }
   ]
