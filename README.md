@@ -53,3 +53,5 @@
 - `sw.js` — Service Worker（ページはネットワーク優先、書影はキャッシュ優先）
 - `manifest.json` / `icon-*.png` — PWA まわり
 - `PLAN.md` — 精査で見つかった不具合と改善の計画表
+- `PLAN-SPEED.md` — 高速化の現状分析と実施計画
+- `HANDOVER.md` — 引継ぎ資料（設計思想・データモデル・JSとDOMの契約）
