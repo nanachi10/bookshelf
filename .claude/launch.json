@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "bookshelf",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["C:/Users/S31402/AppData/Local/Temp/claude/C--Users-S31402-Documents-GitHub-bookshelf/4999a4cd-7059-4a4d-a805-a703df9f4fe0/scratchpad/server.js"],
+      "port": 8123
+    }
+  ]
+}
