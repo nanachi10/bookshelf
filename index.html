@@ -9,6 +9,11 @@
 <title>本棚</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<!-- 初回の検索と表紙表示が、接続確立（DNS+TLS）ぶんだけ遅れないよう先に張っておく -->
+<link rel="preconnect" href="https://ndlsearch.ndl.go.jp" crossorigin>
+<link rel="preconnect" href="https://images-na.ssl-images-amazon.com">
+<link rel="preconnect" href="https://books.google.com">
+<link rel="dns-prefetch" href="https://api.openbd.jp">
 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&family=Noto+Serif+JP:wght@500;700&display=swap" rel="stylesheet">
 <style>
 :root{
@@ -297,6 +302,7 @@ video{width:100%;height:100%;object-fit:cover}
    保存先：Claudeのプレビュー内では window.storage、
    自分でホストしたときは localStorage。
    ══════════════════════════════════════════════════════════════ */
+const T0=performance.now();   // 起動の所要時間を測る基準点（スクリプト評価開始）
 const KEY='bookshelf:v3', PREV=['bookshelf:v2','bookshelf:v1'];
 const store={
   bad:false,   // 読み込みに失敗した印。立っている間は起動時の上書き保存をしない
@@ -947,12 +953,13 @@ const aCover=isbn=>{ const t=isbn10from13(isbn);
   return t?`https://images-na.ssl-images-amazon.com/images/P/${t}.09.LZZZZZZZ.jpg`:''; };
 const gCover=isbn=>/^\d{13}$/.test(isbn||'')
   ? `https://books.google.com/books/content?vid=ISBN${isbn}&printsec=frontcover&img=1&zoom=1` : '';
-const coverSrcs=b=>[b.cover,aCover(b.isbn),gCover(b.isbn)].filter(Boolean);
+const coverSrcs=b=>[...new Set([b.cover,aCover(b.isbn),gCover(b.isbn)].filter(Boolean))];
 
 function jacketImg(b){
   const s=coverSrcs(b);
   if(!s.length) return `<div class="fallback">${esc(b.title.slice(0,26))}</div>`;
-  return `<img src="${esc(s[0])}" alt="" loading="lazy" data-t="${esc(b.title.slice(0,26))}"
+  return `<img src="${esc(s[0])}" alt="" loading="lazy" decoding="async" data-t="${esc(b.title.slice(0,26))}"
+    data-b="${esc(b.isbn)}"
     data-n="${esc(s.slice(1).map(encodeURIComponent).join(' '))}" onload="ckCover(this)" onerror="nextCover(this)">`;
 }
 // 次の候補へ送る。候補が尽きたら文字（検索結果では灰色の枠）に落とす
@@ -968,8 +975,17 @@ function nextCover(el){
   fbCover(el);
 }
 // 読み込めても中身が「表紙なし」画像のことがある
+let coverT=0;
 function ckCover(el){
-  if(el.naturalWidth<=1||(el.naturalWidth===128&&el.naturalHeight===170)) nextCover(el);
+  if(el.naturalWidth<=1||(el.naturalWidth===128&&el.naturalHeight===170)) return nextCover(el);
+  /* 表示に成功したURLを本に書き戻す。書かないと、描画のたびに
+     同じ当てずっぽう（Amazon→Google）の失敗をやり直すことになる。
+     検索結果の画像（data-b なし）は棚の本ではないので触らない */
+  const b=el.dataset.b&&books.find(x=>x.isbn===el.dataset.b);
+  if(b&&b.cover!==el.src){
+    b.cover=el.src;
+    clearTimeout(coverT); coverT=setTimeout(save,1200);   // 一斉に読み終わるのでまとめて書く
+  }
 }
 function fbCover(el){
   const d=document.createElement('div');
@@ -1246,8 +1262,10 @@ async function spinoffs(g){
 async function volPicker(g,pre){
   const box=document.getElementById('found');
   box.innerHTML='<p class="meta" style="padding:12px 0">全巻を調べています…</p>';
+  const tq0=performance.now();
   let eds=[];
   try{ eds=(await searchSeriesAll(g.series)).filter(e=>e.count>=1); }catch(e){}
+  logAct('巻ピッカー',g.series,performance.now()-tq0);
   if(!eds.length){
     box.innerHTML=lastError
       ? `<p class="meta" style="padding:12px 0;color:var(--alert)">${esc(errText(lastError))}。</p>`
@@ -1492,9 +1510,10 @@ function openFind(q){
       return;
     }
     box.innerHTML='<p class="meta" style="padding:12px 0">探しています…</p>';
-    logAct('検索',raw);
+    const t0=performance.now();
     let items=[];
     try{ items=(await searchBooks(raw)).filter(x=>!books.some(b=>b.isbn===x.isbn)); }catch(e){}
+    logAct('検索',raw,performance.now()-t0);
     items=sortByVolume(items);
     box.innerHTML=items.length
       ? bulkBar(items,raw)+results(items,true,raw)
@@ -1519,7 +1538,7 @@ function sortByVolume(items){
   return withS.map((x,i)=>[order.get(skey(x.series||x.title)), x.vol||0, i, x])
     .sort((a,b)=>a[0]-b[0]||a[1]-b[1]||a[2]-b[2]).map(z=>z[3]);
 }
-let bulkList=[];
+let bulkList=[], bulkEds=[];   // bulkEds＝検索結果から組んだ全版。追加時に引き直さないための控え
 function bulkBar(items,q){
   /* 作品（主題名）ごとにまとめ、その中を版（著者＋必要なら版元）で割る。
      題名だけで束ねると小説と漫画が混ざる */
@@ -1546,6 +1565,7 @@ function bulkBar(items,q){
   });
   bulkList=(best&&best.count>=2)
     ? [...best.vols.values()].sort((a,b)=>a.vol-b.vol) : [];
+  bulkEds=bulkList.length?sibs:[];
   if(!bulkList.length) return '';
   // 同じ題名に版が2つ以上あるときは、どれを入れるか選ばせる
   const multi=sibs.filter(e=>e.ak&&e.count>=2);
@@ -1579,8 +1599,8 @@ function bulkBar(items,q){
 const META='bookshelf:meta';
 let meta={done:[],sort:'added',dir:1,exportAt:0,exportN:0,newAt:0,newVols:{}};
 let doneKeys=new Set();
-async function loadMeta(){
-  const m=await store.get(META);
+// 読み込み済みの値を受け取る形にして、起動時に books と並列で読めるようにする
+function loadMeta(m){
   if(m&&typeof m==='object') Object.assign(meta,m);
   else{
     // 旧形式（localStorage 直書き）からの引き継ぎ
@@ -1606,8 +1626,12 @@ const newOf=g=>(meta.newVols[gkey(g)]||[]).filter(v=>!g.by.has(v));
    次の機能を考える材料にするため。外に送ることはない。 */
 const LOG='bookshelf:log';
 let oplog=[], logT=0;
-function logAct(type,detail){
-  oplog.push({t:Date.now(), type, d:String(detail==null?'':detail).slice(0,120)});
+/* ms は所要時間（あれば）。実機の遅さは開発機では再現できないので、
+   利用者の「操作の記録」がそのまま性能の実測値になるようにしておく */
+function logAct(type,detail,ms){
+  const e={t:Date.now(), type, d:String(detail==null?'':detail).slice(0,120)};
+  if(ms!=null) e.ms=Math.round(ms);
+  oplog.push(e);
   if(oplog.length>600) oplog=oplog.slice(-500);
   clearTimeout(logT);
   logT=setTimeout(()=>store.set(LOG,oplog),800);   // 連続操作は800msまとめて書く
@@ -1712,6 +1736,7 @@ async function runBulkInput(){
   if(!lines.length){ toast('1行に1作品ずつ書いてください',true); return; }
   go.disabled=true;
   bulkFound=[];
+  const t0=performance.now();
   for(let i=0;i<lines.length;i++){
     const {name,range}=lines[i];
     box.innerHTML=`<p class="meta" style="padding:10px 0">${esc(name)} を調べています（${i+1}/${lines.length}）…</p>`;
@@ -1721,6 +1746,7 @@ async function runBulkInput(){
                     err:!eds.length&&!!lastError, dirty:false});
     await sleep(250);                       // 国会図書館に連打しない
   }
+  logAct('まとめて調査',`${lines.length}作品`,performance.now()-t0);
   go.disabled=false;
   // 選んでいる版（著者）の巻。「両方」は小説と漫画の同じ巻を両方数える
   const itemsOf=r=>{
@@ -1832,6 +1858,7 @@ async function checkNew(){
   }
   const found=[]; let err=null;
   const hits={};
+  const t0=performance.now();
   for(let i=0;i<gs.length;i++){
     const g=gs[i];
     box.innerHTML=`<div class="lab">新刊を調べています</div>
@@ -1848,7 +1875,7 @@ async function checkNew(){
      次に開いたときも札とストリップに出て、買い逃しに気づけるようにする。
      書誌そのものは持ち越さない（固定化すると最新巻が古いまま嘘になる）。 */
   if(!err){ meta.newVols=hits; meta.newAt=Date.now(); await saveMeta(); render(); }
-  logAct('新刊確認',`${gs.length}作品｜新刊${found.length}件`);
+  logAct('新刊確認',`${gs.length}作品｜新刊${found.length}件`,performance.now()-t0);
   if(!found.length){
     box.innerHTML=`<div class="lab">新刊</div><p class="meta" style="padding:12px 0">`
       +(err?`調べきれませんでした。${errText(err)}。`
@@ -1983,32 +2010,30 @@ function wire(box,items,q,own){
   });
   const bulk=box.querySelector('#bulk');
   if(bulk) bulk.onclick=async()=>{
-    const name=seriesOf(bulkList[0]).series;
-    bulk.textContent='全巻を探しています…';
     const sel=((box.querySelector('#bed')||{}).value)||null;   // 版の選択（あれば）
+    /* 入れる巻は検索時の控え（bulkEds）から組む。以前はここで searchSeriesAll を
+       引き直していて2〜6秒待たせていたが、範囲プルダウンの選択肢も bulkEds から
+       作っており、画面に見えている巻と実際に入る巻はこのデータで一致する */
     let list=[];
-    try{
-      const eds=await searchSeriesAll(name);
-      if(sel==='both'){
-        const m=new Map();
-        eds.forEach(e=>e.items.forEach(x=>{
-          const kk=e.ak+'|'+e.pk+'#'+x.vol; if(!m.has(kk)) m.set(kk,x); }));
-        list=[...m.values()].sort((a,b)=>a.vol-b.vol);
-      }else if(sel){
-        const e=eds.find(x=>x.ak+'|'+x.pk===sel); list=e?e.items:[];
-      }else if(eds.length){
-        // 版の選択が無いときは従来どおり：主版＋足りない巻を他から補う
-        const vols=new Map();
-        eds.forEach(e=>e.items.forEach(x=>{ if(!vols.has(x.vol)) vols.set(x.vol,x); }));
-        list=[...vols.values()].sort((a,b)=>a.vol-b.vol);
-      }
-    }catch(e){}
-    if(!list.length) list=bulkList;                         // 拾えなければ見えている分だけ
+    if(sel==='both'){
+      const m=new Map();
+      bulkEds.forEach(e=>e.vols.forEach(x=>{
+        const kk=e.ak+'|'+e.pk+'#'+x.vol; if(!m.has(kk)) m.set(kk,x); }));
+      list=[...m.values()].sort((a,b)=>a.vol-b.vol);
+    }else if(sel){
+      const e=bulkEds.find(x=>x.ak+'|'+x.pk===sel);
+      list=e?[...e.vols.values()].sort((a,b)=>a.vol-b.vol):[];
+    }else{
+      // 版の選択が無いときは従来どおり：主版＋足りない巻を他の版から補う
+      const vols=new Map();
+      bulkEds.forEach(e=>e.vols.forEach(x=>{ if(!vols.has(x.vol)) vols.set(x.vol,x); }));
+      list=[...vols.values()].sort((a,b)=>a.vol-b.vol);
+    }
+    if(!list.length) list=bulkList;                         // 念のための逃げ道
     // 範囲の指定（プルダウン）があればそれで絞る
     const from=+((box.querySelector('#bfrom')||{}).value||1);
     const toSel=(box.querySelector('#bto')||{}).value||'all';
-    list=list.map(x=>Object.assign({},x,seriesOf(x)))
-      .filter(x=>!books.some(b=>b.isbn===x.isbn))
+    list=list.filter(x=>!books.some(b=>b.isbn===x.isbn))
       .filter(x=>!x.vol||(x.vol>=from&&(toSel==='all'||x.vol<=+toSel)));
     let n=0;
     for(const x of list){
@@ -2148,6 +2173,32 @@ function stopScan(fromPop){
 }
 document.getElementById('stop').onclick=()=>stopScan();
 
+/* ══ 表紙の一括補完 ══
+   表紙URLの無い本は、描画のたびに Amazon の当てずっぽうに頼っている。
+   openBD は ISBN のカンマ区切りで一括照会できるので、1〜2回の通信で
+   棚全体ぶんの表紙URLを埋められる。勝手には走らせない（メニューから手動）。 */
+async function fillCovers(){
+  const targets=books.filter(b=>isISBN13(b.isbn)&&!b.cover);
+  if(!targets.length){ toast('表紙URLの無い本はありません'); return; }
+  toast(`${targets.length}冊の表紙を探しています…`);
+  const t0=performance.now();
+  let n=0;
+  try{
+    for(let i=0;i<targets.length;i+=500){          // URLが長くなりすぎない単位で刻む
+      const part=targets.slice(i,i+500);
+      const r=await fetch('https://api.openbd.jp/v1/get?isbn='+part.map(b=>b.isbn).join(','));
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      (await r.json()).forEach((d,j)=>{
+        const c=d&&d.summary&&d.summary.cover;
+        if(c){ part[j].cover=c; n++; }
+      });
+    }
+  }catch(e){ toast('openBD に届きませんでした',true); return; }
+  logAct('表紙補完',`${targets.length}冊中${n}冊`,performance.now()-t0);
+  if(n){ await save(); render(); closeSheet(); }
+  toast(n?`${n}冊の表紙が見つかりました`:'openBD にも表紙がありませんでした',!n);
+}
+
 /* ══ メニュー ══ */
 document.getElementById('more').onclick=()=>{
   const gs=build(books), authors={};
@@ -2167,6 +2218,7 @@ document.getElementById('more').onclick=()=>{
     <div class="lab">調べる</div>
     <div class="menu">
       <button id="new">新刊を調べる${fresh?`　<span class="fresh">新刊${fresh}</span>`:''}</button>
+      <button id="covfill">表紙を補う（openBD で一括）</button>
     </div>
     <div class="lab">片づける</div>
     <div class="menu">
@@ -2198,6 +2250,7 @@ document.getElementById('more').onclick=()=>{
   document.getElementById('binput').onclick=()=>openBulkInput();
   document.getElementById('usb').onclick=()=>openScanUSB();
   document.getElementById('new').onclick=()=>checkNew();
+  document.getElementById('covfill').onclick=()=>fillCovers();
   document.getElementById('net').onclick=()=>{
     const box=document.getElementById('card');
     diagnose(box).then(()=>wire(box,[],''));
@@ -2283,7 +2336,7 @@ function openLog(){
     <div class="rows">${oplog.slice(-60).reverse().map(e=>
       `<div class="r"><span style="color:var(--dim);flex:0 0 auto">${esc(fmt(e.t))}</span>
         <span style="margin-left:10px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right">${
-        esc(e.type)}　${esc(e.d)}</span></div>`).join('')
+        esc(e.type)}　${esc(e.d)}${e.ms?'　'+e.ms+'ms':''}</span></div>`).join('')
       ||'<p class="meta" style="padding:10px 0">まだ何もありません。</p>'}</div>
     <div class="menu" style="margin-top:12px">
       <button id="logdl">記録を JSON で書き出す</button>
@@ -2379,23 +2432,29 @@ function toast(msg,warn,action){
   clearTimeout(tt); tt=setTimeout(()=>el.classList.remove('on'),action?6000:2200);
 }
 (async()=>{
-  books=(await store.get(KEY))||[];
+  // 3つの読み込みは互いに独立なので、直列に待たず一度に引く
+  const [b0,m0,l0]=await Promise.all([store.get(KEY),store.get(META),store.get(LOG)]);
+  books=b0||[];
+  let fromPrev=false;
   if(!books.length){
     for(const k of PREV){
       const old=await store.get(k);
-      if(Array.isArray(old)&&old.length){ books=old; break; }
+      if(Array.isArray(old)&&old.length){ books=old; fromPrev=true; break; }
     }
   }
+  // normalize は同じオブジェクトを直接直すので、比較用の控えは先に取る
+  const before=fromPrev?'':JSON.stringify(books);
   books=books.map(normalize).filter(b=>b.title);
-  await loadMeta();
-  oplog=(await store.get(LOG))||[];
-  if(!Array.isArray(oplog)) oplog=[];
-  logAct('起動',`${books.length}冊`);
+  loadMeta(m0);
+  oplog=Array.isArray(l0)?l0:[];
   /* 読み込みに失敗したときは保存しない。空の棚で上書きすると、
      壊れていた（＝直せたかもしれない）データまで消えてしまう */
   if(store.bad) toast('保存データを読み込めませんでした。元のデータは退避してあります',true);
-  else await save();
+  /* 以前は毎起動、無条件に全冊を書き戻していた。書くのは中身が実際に
+     変わったとき（旧形式からの移行・normalize による補正）だけでよい */
+  else if(fromPrev||JSON.stringify(books)!==before) await save();
   render();
+  logAct('起動',`${books.length}冊`,performance.now()-T0);
 })();
 </script>
 <script>
