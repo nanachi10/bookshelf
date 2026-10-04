@@ -272,6 +272,15 @@ main.still .series,main.still .book{animation:none}
 
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 :focus-visible{outline:2px solid var(--foil);outline-offset:2px}
+.sync-book{margin:16px 0;padding:12px;border:1px solid #ccc;border-radius:8px;overflow-wrap:anywhere}
+.sync-book summary{cursor:pointer;min-height:44px;line-height:1.6}
+.sync-field{padding:10px 0;border-top:1px solid #ccc}
+.sync-choice{display:block;width:100%;min-height:44px;margin:8px 0;font:inherit}
+.sync-values{font-size:13px;white-space:pre-wrap;overflow-wrap:anywhere}
+.sync-values p{margin:6px 0}
+.sync-check{display:flex;align-items:center;gap:8px;min-height:44px;font-size:14px;overflow-wrap:anywhere}
+.sync-check input{flex-shrink:0;width:20px;height:20px}
+#syncresult,#syncmessage{white-space:pre-wrap;overflow-wrap:anywhere}
 </style>
 </head>
 <body>
@@ -314,39 +323,135 @@ const T0=performance.now();   // 起動の所要時間を測る基準点（ス�
 const KEY='bookshelf:v3', PREV=['bookshelf:v2','bookshelf:v1'];
 const store={
   bad:false,   // 読み込みに失敗した印。立っている間は起動時の上書き保存をしない
+  missing:new Set(), blocked:new Set(),
+  async quarantine(k){
+    this.bad=true; this.blocked.add(k);
+    // 起動後の表紙補完や編集も、読めなかった元データを上書きしてはいけない。
+    // 退避先が既にある場合は、その復旧材料も保持する。
+    try{
+      const read=async key=>window.storage?(await window.storage.get(key))?.value:localStorage.getItem(key);
+      const raw=await read(k), old=await read(k+':broken');
+      if(raw!=null&&old==null){
+        if(window.storage) await window.storage.set(k+':broken',raw);
+        else localStorage.setItem(k+':broken',raw);
+      }
+    }catch(e){}                         // 退避不能でも元キーへの書き込みは止める
+  },
   async get(k){
     let raw=null;
     try{
       if(window.storage){ const r=await window.storage.get(k); raw=r?r.value:null; }
       else raw=localStorage.getItem(k);
-    }catch(e){ this.bad=true; return null; }
-    if(raw==null) return null;
+    }catch(e){ this.bad=true; this.blocked.add(k); return null; }
+    if(raw==null){ this.missing.add(k); return null; }
+    this.missing.delete(k);
     try{ return JSON.parse(raw); }
     catch(e){
       // 壊れたデータは消さずに退避する。空で上書きすると復旧の手がかりごと失う
-      this.bad=true;
-      try{ localStorage.setItem(k+':broken',raw); }catch(e2){}
+      await this.quarantine(k);
       return null;
     }
   },
   async set(k,v,quiet){
+    if(this.blocked.has(k)){
+      if(!quiet) toast('元の保存データを保護しているため、保存できません。控えの復旧が必要です',true);
+      return false;
+    }
     const s=JSON.stringify(v);
     try{
-      if(window.storage){ await window.storage.set(k,s); return; }
+      if(window.storage){ await window.storage.set(k,s); return true; }
       localStorage.setItem(k,s);
+      return true;
     }catch(e){
       /* 置き場所が足りないのなら、まず検索の控えを捨てて場所を空ける。
          棚そのものより控えのほうが失って構わないのに、
          先に場所を取っていたせいで大事なほうが負ける、を防ぐ */
       if(!quiet&&k!==QKEY&&dropQCache()){
-        try{ localStorage.setItem(k,s); return; }catch(e2){}
+        try{
+          if(window.storage){
+            await window.storage.set(QKEY,'{}');
+            await window.storage.set(k,s);
+          }else localStorage.setItem(k,s);
+          return true;
+        }catch(e2){}
       }
       if(!quiet) toast('保存できませんでした',true);   // 検索の控えの保存失敗は騒がない
+      return false;
     }
   }
 };
 // 保存＝棚が変わった印。束ねの計算結果（build のメモ）はここで捨てる
-const save=()=>{ buildCache=null; return store.set(KEY,books); };
+const save=(next=books)=>{ buildCache=null; return store.set(KEY,next); };
+// 非同期保存中の別操作も直列にする。失敗した候補を棚や履歴へ反映しない。
+let stateQueue=Promise.resolve();
+const stateJob=fn=>{ const p=stateQueue.then(fn); stateQueue=p.catch(()=>{}); return p; };
+async function changeBooks(make){
+  return stateJob(async()=>{
+    const next=make(books);
+    if(!next||await save(next)===false) return false;
+    books=next; buildCache=null; return true;
+  });
+}
+const metaSnapshot=()=>Object.assign({},meta,{done:[...doneKeys],sort:sortBy,dir:sortDir});
+async function changeMeta(make){
+  return stateJob(async()=>{
+    const next=make(JSON.parse(JSON.stringify(metaSnapshot())));
+    if(!next||await store.set(META,next)===false) return false;
+    meta=next; loadMeta(next); return true;
+  });
+}
+const PENDING='bookshelf:pending-import';
+// 2キーの読み込みは旧値を先に保存。途中で電源が切れても起動時に旧状態へ戻す。
+async function restorePending(record){
+  const a=await store.set(KEY,record.before.books,true);
+  const b=await store.set(META,record.before.meta,true);
+  const cleared=a&&b&&await store.set(PENDING,null,true);
+  if(!cleared){ store.blocked.add(KEY); store.blocked.add(META); }
+  return !!cleared;
+}
+async function importState(incoming,data){
+  return stateJob(async()=>{
+    if(store.blocked.has(KEY)||store.blocked.has(META)||store.blocked.has(PENDING)) return false;
+    const seen=new Set(books.map(b=>b.isbn)), next=books.slice(), nextMeta=JSON.parse(JSON.stringify(metaSnapshot()));
+    incoming.forEach(b=>{ if(!seen.has(b.isbn)){ next.push(b); seen.add(b.isbn); } });
+    next.sort((x,y)=>(y.added||0)-(x.added||0));
+    if(!Array.isArray(data)){
+      nextMeta.done=[...new Set(nextMeta.done.concat((Array.isArray(data.done)?data.done:[]).filter(k=>typeof k==='string')))];
+      if(data.sort&&SORTS.some(x=>x.id===data.sort)) nextMeta.sort=data.sort;
+      if(data.dir===1||data.dir===-1) nextMeta.dir=data.dir;
+    }
+    const added=next.length-books.length;
+    return await writeShelfState(next,nextMeta)?{added}:false;
+  });
+}
+// 読み込みと端末間の反映で同じ復旧手順を使う。stateJob の中から呼ぶ。
+async function writeShelfState(next,nextMeta){
+  const record={version:1,before:{books,meta:metaSnapshot()}};
+  if(await store.set(PENDING,record)===false) return false;
+  const written=await store.set(KEY,next)&&await store.set(META,nextMeta);
+  if(!written||await store.set(PENDING,null,true)===false){
+    const restored=await restorePending(record);
+    toast(restored?'読み込みを保存できませんでした。元の棚に戻しました。もう一度試してください'
+      :'読み込みを保存できませんでした。元の棚を表示し、変更を停止しています。控えを取り、再起動してください',true);
+    return false;
+  }
+  books=next; meta=nextMeta; loadMeta(nextMeta); buildCache=null; return true;
+}
+async function recoverPending(){
+  const record=await store.get(PENDING);
+  if(store.blocked.has(PENDING)){ store.blocked.add(KEY); store.blocked.add(META); return null; }
+  if(record==null) return null;
+  try{
+    if(record.version!==1||!record.before||!Array.isArray(record.before.books)) throw new Error('復旧記録が不正です');
+    const before={books:record.before.books.map(normalize),meta:record.before.meta};
+    validateMeta(before.meta);
+    if(!before.meta) throw new Error('復旧設定がありません');
+    const restored=await restorePending(record);
+    return {before,restored};
+  }catch(e){
+    await store.quarantine(PENDING); store.blocked.add(KEY); store.blocked.add(META); return null;
+  }
+}
 
 let books=[], filter='', mode='all', addOwn='paper';
 /* 探す画面のワンタップ候補。
@@ -397,16 +502,18 @@ const norm=s=>String(s||'').replace(/[\uFF01-\uFF5E]/g,
   c=>String.fromCharCode(c.charCodeAt(0)-0xFEE0)).replace(/\u3000/g,' ').trim();
 // シリーズ名の突き合わせ鍵。表記ゆれで同じ作品が二段に割れるのを防ぐ
 const skey=s=>norm(s).toLowerCase().replace(/\s+/g,'');
-/* 副題を落とした「主題名」。国会図書館は副題を " : "（両側に空白）で繋ぐ規約で、
-   同じ作品なのに巻の途中から副題つきの別見出しになることがある。
-   「電波教師」は1〜4巻と9巻が副題なし、5巻以降が
-   「電波教師 : HE IS A ULTIMATE TEACHER」で、完全一致で絞ると前半が永久に拾えない。
-   空白なしのコロン（「Re:ゼロから始める異世界生活」）は題名の一部なので切らない。 */
-const mainTitle=s=>{ const t=norm(s), i=t.indexOf(' : ');
-  return i>0?t.slice(0,i).trim():t; };
+/* 読み仮名の表記ゆれだけを揃える。「亜人(デミ)」は「亜人」と同じ。
+   副題の一律削除は氷結の絆・外伝まで本編に混ぜるため、確認済みの別見出しだけ扱う。 */
+const mainTitle=s=>norm(s)
+  .replace(/^亜人\s*[（(]\s*デミ\s*[)）]\s*/,'亜人')
+  .replace(/^電波教師\s*:\s*HE IS A ULTIMATE TEACHER\s*$/i,'電波教師');
 const mkey=s=>skey(mainTitle(s));
+// NDLでは短編集・Ex・章が題名ではなく巻表示に入る。取得は本題、採用はシリーズ完全一致。
+const seriesQuery=s=>mainTitle(s).replace(/\s+(短編集|Ex|第\d+章(?:\s*[（(].*[)）])?)$/i,'');
 function parseSeries(raw){
   let t=norm(raw);
+  const family=t.match(/^(.+?)\s*(短編集|Ex)\s*(\d{1,3})(?:\s*[（(].*[)）])?$/i);
+  if(family&&+family[3]>=1&&+family[3]<=200) return {series:mainTitle(family[1])+' '+(family[2].toLowerCase()==='ex'?'Ex':'短編集'),vol:+family[3]};
   t=t.replace(/\s*[（(][^（）()]*[)）]\s*$/,m=>/[\d上中下]/.test(m)?m:'');
   const pats=[
     /^(.+?)\s*第\s*(\d{1,3})\s*[巻話]\s*$/,
@@ -429,23 +536,30 @@ function parseSeries(raw){
   if(k&&k[1].trim().length>=2) return {series:k[1].trim(), vol:KAN[k[2]]};
   return {series:null, vol:null};
 }
+const classificationIssue=b=>{
+  if(!/(短編集|Ex)\s*\d/i.test(norm(b.title))) return false;
+  const p=parseSeries(b.title);
+  return !!(p.series&&b.series&&(mkey(p.series)!==mkey(b.series)||p.vol!==b.vol));
+};
 
 /* ══ 書誌の取得 ══
    国会図書館を先に引く。openBD の題名は「オーバーロード = OVERLORD. 1」のように
    原題が併記されていて、そのままだとバーコードで入れた巻が
    検索で入れた巻と別のシリーズに割れてしまう。 */
-async function fetchByISBN(isbn){
+async function fetchByISBN(isbn,signal){
+  let error=null;
   try{
-    const j=await ndlQuery({isbn,cnt:5});
-    if(j[0]) return j[0];
-  }catch(e){}
+    const j=await ndlQuery({isbn,cnt:5,signal});
+    const hit=j.find(x=>x.isbn===isbn);
+    if(hit){ lastError=null; return hit; }
+  }catch(e){ if(isCancelled(e,signal)) throw e; error=e; }
   try{
-    const r=await fetch(`https://api.openbd.jp/v1/get?isbn=${isbn}`);
-    const [d]=await r.json(); const s=d&&d.summary;
-    if(s&&s.title) return {isbn,title:ndlTitle(s.title),author:s.author||'',
+    const [d]=await requestData(`https://api.openbd.jp/v1/get?isbn=${isbn}`,'json',{signal}); const s=d&&d.summary;
+    if(s&&s.title){ lastError=null; return {isbn,title:ndlTitle(s.title),author:s.author||'',
       // 刊行日は国会図書館と同じ YYYYMM に揃える。生のままだと刊行順の並びが壊れる
-      publisher:s.publisher||'',date:ym(s.pubdate),cover:s.cover||'',src:'openBD'};
-  }catch(e){}
+      publisher:s.publisher||'',date:ym(s.pubdate),cover:s.cover||'',src:'openBD'}; }
+  }catch(e){ if(isCancelled(e,signal)) throw e; error=e; }
+  checkSignal(signal); lastError=error;
   return null;
 }
 /* 国会図書館サーチを共通の検索口にする。
@@ -454,13 +568,77 @@ async function fetchByISBN(isbn){
    題名から巻数を推測する必要がそもそも無い。 */
 let lastError=null;                      // 直近の通信エラー。原因を利用者に見せるため保持する
 const errText=e=>{
+  if(e&&e.name==='TimeoutError') return '応答に時間がかかりすぎました。もう一度試すか、手で登録できます';
+  if(e&&e.name==='AbortError') return '調査を中止しました';
+  if(e&&e.name==='EditionAmbiguousError') return e.message;
+  if(e&&['PartialResultsError','SeriesMismatchError'].includes(e.name)) return e.message;
+  if(e&&e.name==='UnresolvedVolumesError') return e.message;
   const m=(e&&e.message)||'';
+  if(/保存できません/.test(m)) return m;
   if(/HTTP 429/.test(m)) return 'アクセスが多すぎると断られました（しばらく待つと戻ります）';
   if(/^HTTP /.test(m))   return '相手のサーバがエラーを返しました（'+m+'）';
   return '通信が届きませんでした。ネットワークか、ページの置き場所の制限かもしれません';
 };
 
 const NDL='https://ndlsearch.ndl.go.jp/api/opensearch';
+const isCancelled=(e,signal)=>!!(signal&&signal.aborted)||e&&e.name==='AbortError';
+const checkSignal=signal=>{ if(signal&&signal.aborted) throw signal.reason||new DOMException('中止しました','AbortError'); };
+function abortable(p,signal){
+  checkSignal(signal);
+  if(!signal) return p;
+  return new Promise((resolve,reject)=>{
+    const stop=()=>reject(signal.reason||new DOMException('中止しました','AbortError'));
+    signal.addEventListener('abort',stop,{once:true});
+    Promise.resolve(p).then(resolve,reject).finally(()=>signal.removeEventListener('abort',stop));
+  });
+}
+const waitRequest=(ms,signal)=>{
+  checkSignal(signal);
+  return new Promise((resolve,reject)=>{
+    const end=()=>{ clearTimeout(timer); if(signal) signal.removeEventListener('abort',stop); };
+    const stop=()=>{ end(); reject(signal.reason||new DOMException('中止しました','AbortError')); };
+    const timer=setTimeout(()=>{end();resolve();},ms);
+    if(signal) signal.addEventListener('abort',stop,{once:true});
+  });
+};
+// 応答本文まで30秒を上限にする。混雑/一時障害だけ1回再試行し、連打しない。
+async function requestData(url,kind,{signal,timeout=30000}={}){
+  for(let attempt=0;attempt<2;attempt++){
+    checkSignal(signal);
+    const ctl=new AbortController(), relay=()=>ctl.abort(signal.reason);
+    if(signal) signal.addEventListener('abort',relay,{once:true});
+    const timer=setTimeout(()=>ctl.abort(new DOMException('応答待ちの期限を超えました','TimeoutError')),timeout);
+    let retry=0;
+    try{
+      const r=await abortable(fetch(url,{signal:ctl.signal}),ctl.signal);
+      if(attempt===0&&[429,502,503,504].includes(r.status)){
+        const raw=r.headers&&r.headers.get('Retry-After');
+        const seconds=Number(raw), date=Date.parse(raw||'');
+        retry=raw?(Number.isFinite(seconds)?seconds*1000:Math.max(0,date-Date.now())):1500;
+        // 長いRetry-Afterは自動再試行せず利用者に待ってもらう。
+        if(!Number.isFinite(retry)||retry>5000) throw new Error('HTTP '+r.status);
+        retry=Math.max(1500,retry);
+        if(r.body&&r.body.cancel) await abortable(r.body.cancel(),ctl.signal);
+      }else{
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        return await abortable(kind==='json'?r.json():r.text(),ctl.signal);
+      }
+    }finally{
+      clearTimeout(timer); if(signal) signal.removeEventListener('abort',relay);
+    }
+    await waitRequest(retry,signal);
+  }
+}
+// 同じ画面でやり直す／画面を離れると通信も止め、遅い旧応答を使わない。
+const viewJobs=new Map();
+function viewJob(key){
+  const old=viewJobs.get(key); if(old) old.abort();
+  const ctl=new AbortController(); viewJobs.set(key,ctl);
+  return {signal:ctl.signal,current:()=>viewJobs.get(key)===ctl&&!ctl.signal.aborted,
+    cancel:()=>{ctl.abort();if(viewJobs.get(key)===ctl)viewJobs.delete(key);}};
+}
+function cancelViewJobs(){ viewJobs.forEach(ctl=>ctl.abort()); viewJobs.clear(); }
+
 const textOf=(el,tag)=>{ const n=el.getElementsByTagName(tag)[0]; return n?n.textContent.trim():''; };
 
 /* 刊行日を YYYYMM に揃える。国会図書館は "2015.11" "2009.6" "[2019]" と形がまちまちで、
@@ -477,9 +655,20 @@ function ym(s){
 // dcndl:volume は "3" のことも "上" のことも "3上" のこともある
 function volOf(s){
   const t=norm(s); if(!t) return null;
-  const m=t.match(/\d{1,3}/);
-  if(m){ const v=+m[0]; return (v>=1&&v<=200)?v:null; }
-  return KAN[t[0]]||null;
+  const m=t.match(/^(?:第\s*|Vol\.?\s*)?(\d{1,3})(?:\s*巻|[上中下])?$/i);
+  if(m){ const v=+m[1]; return (v>=1&&v<=200)?v:null; }
+  return KAN[t]||null;
+}
+function ndlSeries(base,label){
+  const t=norm(label), title=mainTitle(base);
+  if(!t){ const p=parseSeries(title); return {series:p.series||title,vol:p.vol}; }
+  let m=t.match(/^(短編集|Ex)\s*(\d{1,3})?(?:\s*[（(].*[)）])?$/i);
+  if(m){ const family=m[1].toLowerCase()==='ex'?'Ex':'短編集';
+    return {series:title+' '+family,vol:m[2]?volOf(m[2]):null,volumeLabel:t,volumeAmbiguous:!m[2]}; }
+  m=t.match(/^(第\d+章(?:\s*[（(].*[)）])?)\s+(\d{1,3})$/);
+  if(m) return {series:title+' '+m[1],vol:volOf(m[2]),volumeLabel:t};
+  const vol=volOf(t);
+  return {series:title,vol,volumeLabel:t,volumeAmbiguous:!vol};
 }
 /* 「オーバーロード = OVERLORD. 1」→ 見出し「オーバーロード 1」＋原題「OVERLORD」。
    原題は捨てずに持っておく。英語の題で探す人はここに当たる。
@@ -504,6 +693,16 @@ const ndlTitle=s=>ndlSplit(s).base;
    SWで書誌を固定化しない方針はそのまま——これは期限と逃げ道つきの控え。 */
 const qcache=new Map();
 const QKEY='bookshelf:qcache';
+const QVER=3; // 分割取得の完全性・番号未確定の記録を持たない旧控えは再利用しない。
+const queryIssue=items=>{
+  const c=items&&items.coverage;
+  if(c&&(!c.complete||c.stale)){
+    const e=new Error(c.stale?'通信できず古い結果を表示しています。全巻・新刊の確認は完了していません'
+      :'検索応答が一部だけです。取得できた巻を表示していますが、全巻・新刊の確認は完了していません');
+    e.name='PartialResultsError'; return e;
+  }
+  return null;
+};
 let qdisk=null, qdiskT=0;
 async function qload(){
   if(!qdisk){
@@ -534,44 +733,98 @@ async function ndlQuery(p){
   const u=NDL+'?mediatype=books&cnt='+(p.cnt||200)+'&idx='+(p.idx||1)
     +(p.title?'&title='+encodeURIComponent(p.title):'')
     +(p.isbn ?'&isbn=' +encodeURIComponent(p.isbn) :'')
-    +(p.any  ?'&any='  +encodeURIComponent(p.any)  :'');
-  const qd=await qload();
+    +(p.any  ?'&any='  +encodeURIComponent(p.any)  :'')
+    +(p.from ?'&from='+encodeURIComponent(p.from):'')
+    +(p.until?'&until='+encodeURIComponent(p.until):'');
+  const qd=await qload(); checkSignal(p.signal);
   if(!p.fresh){
     const hit=qcache.get(u);
-    if(hit&&Date.now()-hit.t<600000) return hit.p;
+    if(hit&&Date.now()-hit.t<600000&&(!p.signal||hit.items)) return hit.items||hit.p;
     const dk=qd[u];
-    if(dk&&Date.now()-dk.t<(p.isbn?2592000000:21600000)) return dk.items;
+    if(dk&&dk.v===QVER&&Date.now()-dk.t<(p.isbn?2592000000:21600000)){
+      const items=dk.items.slice(); items.coverage=dk.coverage; return items;
+    }
   }
-  const job=ndlFetch(u).then(items=>{
+  const entry={t:Date.now()};
+  const job=ndlFetch(u,p.signal).then(items=>{
+    checkSignal(p.signal);
+    if(qcache.get(u)!==entry) return items;
+    entry.items=items;
     /* 端末に残すのは「大きく引いて実際に当たった」応答だけ。
        0件を残すと、NDLが一時的に不調で 200＋空を返したときに
        「見つかりませんでした」が6時間固定されてしまう。
        打鍵ごとのサジェスト（cnt=25）も残さない——数が多く、
        古い順の間引きで肝心の全巻リスト（cnt=500）を押し流す。 */
-    if(items.length&&(p.cnt||200)>=200){ qd[u]={t:Date.now(),items}; qsave(); }
+    if(items.length&&!queryIssue(items)&&(p.cnt||200)>=200){ qd[u]={v:QVER,t:Date.now(),items,coverage:items.coverage}; qsave(); }
     return items;
   });
-  qcache.set(u,{t:Date.now(),p:job});
+  entry.p=job; qcache.set(u,entry);
   try{ return await job; }
   catch(e){
-    qcache.delete(u);                        // 失敗は覚えない（次はまた引く）
+    if(qcache.get(u)===entry) qcache.delete(u); // 旧応答の失敗で新しい結果を消さない
+    if(isCancelled(e,p.signal)) throw e;
     /* 期限切れでも手元に控えがあれば、それでしのぐ。429で真っ白より
        「少し前の結果」のほうがましで、その旨は一度だけ知らせる。
        新刊チェック（fresh）は正直に失敗させる——古い控えで「新刊なし」を装わない */
     const dk=!p.fresh&&qd[u];
-    if(dk){
+    if(dk&&dk.v===QVER){
       if(Date.now()-staleAt>4000){ staleAt=Date.now(); toast('通信できないため、少し前の結果を出しています',true); }
-      return dk.items;
+      const items=dk.items.slice(); items.coverage=Object.assign({},dk.coverage,{stale:true}); return items;
     }
     throw e;
   }
 }
-async function ndlFetch(u){
-  let r=await fetch(u);
-  // 混んでいて断られたら、少し待って一度だけ引き直す
-  if(r.status===429){ await sleep(1500); r=await fetch(u); }
-  if(!r.ok) throw new Error('HTTP '+r.status);
-  const doc=new DOMParser().parseFromString(await r.text(),'application/xml');
+/* 501件目へページ送りはできない。出版年の重ならない区間に分け、件数・記録IDが
+   合う場合だけ取得完了とする。日付不明・同年500件超・途中失敗・予算切れは未完了。
+   通常の500件以内の問い合わせは増やさない。追加は最大6回、逐次・中止可能。 */
+async function ndlSeriesQuery(p){
+  const root=await ndlQuery(Object.assign({},p,{cnt:500}));
+  const initial=root.coverage;
+  if(!initial||initial.complete||initial.stale||initial.total<=500||!initial.received||p.from||p.until) return root;
+  let remaining=6, issue=null;
+  const observed=new Set((initial.recordKeys||[]).filter(Boolean));
+  const merge=(a,b)=>{
+    const seen=new Set();
+    return a.concat(b).filter(x=>{const k=x._recordId||JSON.stringify([x.isbn,x.title,x.volumeLabel]);
+      if(seen.has(k)) return false; seen.add(k); return true;});
+  };
+  const visit=async(items,lo,hi)=>{
+    const c=items.coverage;
+    if(!c||c.stale) return {items,complete:false,keys:[]};
+    if(c.complete) return {items,complete:true,keys:c.recordKeys||[]};
+    if(c.total<=500||lo>=hi||remaining<2) return {items,complete:false,keys:[]};
+    const years=(c.years||[]).filter(y=>y>=lo&&y<=hi).sort((a,b)=>a-b);
+    if(!years.length) return {items,complete:false,keys:[]};
+    const pivot=Math.max(lo,Math.min(hi-1,years[Math.floor((years.length-1)/2)]));
+    let a,b;
+    try{
+      remaining--; await waitRequest(250,p.signal);
+      a=await ndlQuery(Object.assign({},p,{cnt:500,from:lo===1?null:String(lo).padStart(4,'0')+'-01-01',until:String(pivot).padStart(4,'0')+'-12-31'}));
+      (a.coverage&&a.coverage.recordKeys||[]).filter(Boolean).forEach(k=>observed.add(k));
+      remaining--; await waitRequest(250,p.signal);
+      b=await ndlQuery(Object.assign({},p,{cnt:500,from:String(pivot+1).padStart(4,'0')+'-01-01',until:hi===9999?null:String(hi).padStart(4,'0')+'-12-31'}));
+      (b.coverage&&b.coverage.recordKeys||[]).filter(Boolean).forEach(k=>observed.add(k));
+    }catch(e){if(isCancelled(e,p.signal)) throw e; issue=e; return {items:merge(items,a||[]),complete:false,keys:[]};}
+    // 年の無い記録が除外されたり、検索中に件数が変わった場合は全取得と断定しない。
+    const usable=a.coverage&&b.coverage&&!a.coverage.stale&&!b.coverage.stale
+      &&a.coverage.total!==null&&b.coverage.total!==null&&a.coverage.total+b.coverage.total<=c.total;
+    if(!usable) return {items:merge(items,merge(a,b)),complete:false,keys:[]};
+    const consistent=a.coverage.total+b.coverage.total===c.total;
+    const left=await visit(a,lo,pivot), right=await visit(b,pivot+1,hi);
+    const keys=left.keys.concat(right.keys);
+    const keySet=new Set(keys);
+    const complete=consistent&&left.complete&&right.complete&&keys.length===c.total
+      &&keys.every(Boolean)&&keySet.size===c.total&&(c.recordKeys||[]).every(k=>keySet.has(k));
+    return {items:merge(items,merge(left.items,right.items)),complete,keys};
+  };
+  const result=await visit(root,1,9999); checkSignal(p.signal);
+  result.items.coverage=Object.assign({},initial,{complete:result.complete,partitioned:true,
+    extraRequests:6-remaining,observedRecords:observed.size,recordKeys:result.keys,error:issue?issue.message:null});
+  return result.items;
+}
+async function ndlFetch(u,signal){
+  const text=await requestData(u,'text',{signal});
+  const doc=new DOMParser().parseFromString(text,'application/xml');
   if(doc.getElementsByTagName('parsererror').length) throw new Error('応答を読み取れませんでした');
   /* ここでISBNの重複を潰してはいけない。国会図書館は同じ本を複数の見出しで返し
      （「ソードアート・オンライン 1」は「アインクラッド」名義のレコードが先に来る）、
@@ -592,37 +845,47 @@ async function ndlFetch(u){
     if(!isbn||!isISBN13(isbn)) return;
     const sp=ndlSplit(textOf(it,'dc:title'));
     const base=sp.base; if(!base) return;
-    const vol=volOf(textOf(it,'dcndl:volume'));
-    out.push({isbn, alt:sp.alt, title: vol?base+' '+vol:base,
+    const label=textOf(it,'dcndl:volume'), parsed=ndlSeries(base,label);
+    out.push(Object.assign({isbn, alt:sp.alt, _recordId:textOf(it,'guid')||textOf(it,'link'),title: label?base+' '+norm(label):base,
       // 「夏目, 漱石, 1867-1916」の形で来る。生没年は落として姓名だけ繋ぐ
       author:(textOf(it,'dc:creator')||'').replace(/,\s*\d{4}-(\d{4})?/g,'').replace(/,\s*/g,''),
       publisher:textOf(it,'dc:publisher'),
       date:ym(textOf(it,'dcterms:issued')||textOf(it,'dc:date')),
-      cover:'', src:'国会図書館', series:base, vol});
+      cover:'', src:'国会図書館'},parsed));
   });
+  const all=doc.getElementsByTagName('item').length;
+  const totalText=textOf(doc,'openSearch:totalResults')||textOf(doc,'opensearch:totalResults');
+  const total=/^\d+$/.test(totalText)?Number(totalText):null;
+  const params=new URL(u).searchParams, start=Number(params.get('idx')||1), requested=Number(params.get('cnt')||200);
+  // 件数はISBN・言語で除外する前のRSS item数と照合する。
+  const rawItems=[...doc.getElementsByTagName('item')];
+  const recordKeys=rawItems.map(it=>textOf(it,'guid')||textOf(it,'link'));
+  const years=rawItems.map(it=>Number(ym(textOf(it,'dcterms:issued')||textOf(it,'dc:date')).slice(0,4))).filter(y=>y>=1&&y<=9999);
+  out.coverage={total,received:all,start,requested,recordKeys,years,complete:total!==null&&all===total&&start===1};
   return out;
 }
 // 国会図書館が巻数を持っていればそれを使い、無いときだけ題名から推測する
-const seriesOf=x=>(x&&x.vol)?{series:x.series,vol:x.vol}:parseSeries(x.title);
+const seriesOf=x=>x&&x.volumeAmbiguous?{series:x.series,vol:null}
+  :(x&&x.vol)?{series:x.series,vol:x.vol}:parseSeries(x.title);
 
 // 国会図書館は関連度順に返してくれないので、入力に近いものを手前へ寄せる。
 // 原題（OVERLORD など）でも比べ、英語で探した人にも近い順で見せる
 function rank(list,q){
-  const k=skey(q);
+  const k=mkey(q);
   const one=s=>s===k?0 : s.indexOf(k)===0?1 : s.indexOf(k)>=0?2 : 3;
-  const score=x=>Math.min(one(skey(x.series||x.title)), x.alt?one(skey(x.alt)):3);
+  const score=x=>Math.min(one(mkey(x.series||x.title)), x.alt?one(skey(x.alt)):3);
   return list.map((x,i)=>[score(x),x.vol||999,i,x])
              .sort((a,b)=>a[0]-b[0]||a[1]-b[1]||a[2]-b[2]).map(z=>z[3]);
 }
 
 // 題名で当たらなければ全項目検索に広げる。13桁の数字が来たらISBN照会に回す
-async function searchBooks(q){
-  lastError=null;
+async function searchBooks(q,signal){
+  let error=null;
   let out=[];
   const t=norm(q), digits=t.replace(/[^0-9]/g,'');
   if(isISBN13(digits)){
-    try{ out=await ndlQuery({isbn:digits,cnt:5}); }catch(e){ lastError=e; }
-    if(out.length) return dedupe(out);
+    try{ const b=await fetchByISBN(digits,signal); if(b){ lastError=null; return [b]; } }catch(e){ if(isCancelled(e,signal)) throw e; error=e; }
+    checkSignal(signal); if(error) lastError=error; return [];
   }
   /* 英数字の入力（OVERLORD 等の原題）は、題名検索だけだと外伝ばかり集まって
      本編が入らないことがある。全項目検索も足す——直列に待つと倍かかるので同時に投げる。
@@ -630,16 +893,17 @@ async function searchBooks(q){
   const ascii=/^[\x20-\x7E]+$/.test(t);
   if(ascii){
     const [a,b]=await Promise.all([
-      ndlQuery({title:t,cnt:200}).catch(e=>{ lastError=e; return []; }),
-      ndlQuery({any:t,cnt:200}).catch(e=>{ lastError=e; return []; })]);
-    out=a.concat(b);
+      ndlQuery({title:t,cnt:200,signal}).catch(e=>{ if(isCancelled(e,signal)) throw e; error=e; return []; }),
+      ndlQuery({any:t,cnt:200,signal}).catch(e=>{ if(isCancelled(e,signal)) throw e; error=e; return []; })]);
+    error=error||queryIssue(a)||queryIssue(b); out=a.concat(b);
   }else{
-    try{ out=await ndlQuery({title:t,cnt:200}); }catch(e){ lastError=e; }
+    try{ out=await ndlQuery({title:t,cnt:200,signal}); error=error||queryIssue(out); }catch(e){ if(isCancelled(e,signal)) throw e; error=e; }
     if(out.length<8){
-      try{ out=out.concat(await ndlQuery({any:t,cnt:200})); }catch(e){ lastError=e; }
+      try{ const more=await ndlQuery({any:t,cnt:200,signal}); error=error||queryIssue(more); out=out.concat(more); }catch(e){ if(isCancelled(e,signal)) throw e; error=e; }
     }
   }
   // 入力に近い見出しを先に並べてから重複を落とす。こうすると残るのが正しい見出しになる
+  checkSignal(signal); lastError=error;
   return dedupe(rank(out,t));
 }
 const dedupe=list=>{ const s=new Set();
@@ -649,32 +913,38 @@ const dedupe=list=>{ const s=new Set();
    同じ題名に小説版と漫画版が同居することがある——「オーバーロード」は
    丸山くがね＝小説19巻 と 深山フギン＝漫画8巻 が同じ見出し。
    どの版を入れるかは呼び出し側（＝利用者）が選ぶ。
-   cnt=500 で一度に取り切れるのでページ送りは要らない。 */
-async function searchSeriesAll(name,fresh){
-  lastError=null;
+   NDLの上限500件を超える応答は確認未完了として扱う。 */
+async function searchSeriesAll(name,fresh,signal){
+  let error=null;
   let out=[];
-  const q=mainTitle(name);                      // 副題つきの名前で引くと当たらないことがある
-  try{ out=await ndlQuery({title:q,cnt:500,fresh}); }catch(e){ lastError=e; }
-  if(out.length<3){ try{ out=out.concat(await ndlQuery({any:q,cnt:200,fresh})); }catch(e){ lastError=e; } }
+  const q=seriesQuery(name);
+  try{ out=await ndlSeriesQuery({title:q,fresh,signal}); error=queryIssue(out); }catch(e){ if(isCancelled(e,signal)) throw e; error=e; }
+  if(out.length<3){ try{ const more=await ndlQuery({any:q,cnt:200,fresh,signal}); error=error||queryIssue(more); out=out.concat(more); }catch(e){ if(isCancelled(e,signal)) throw e; error=e; } }
+  checkSignal(signal); lastError=error;
   const k=skey(name), mk=mkey(name);
-  const cand=out.map(x=>Object.assign({},x,seriesOf(x))).filter(x=>x.vol);
+  const cand=out.map(x=>Object.assign({},x,seriesOf(x))).filter(x=>x.vol||x.volumeAmbiguous);
   // 原題（OVERLORD 等）で探されたときも、日本語見出しの束に正しく集める
   const exact=cand.filter(x=>skey(x.series)===k||mkey(x.series)===mk
                             ||(x.alt&&skey(x.alt)===k));
-  /* 副題ちがいの見出しからは、まだ無い巻だけを補う。
-     こうすると「電波教師」の1〜4巻を拾いつつ、
-     「オーバーロード : カッツェ平野の幽霊船」のような外伝が
-     本編の1・2巻を上書きしてしまうことがない。 */
-  const seen=new Set(exact.map(x=>x.vol));
-  const extra=cand.filter(x=>!exact.includes(x)&&mkey(x.series)===mk&&!seen.has(x.vol));
-  const eds=splitEditions(exact.concat(extra));
-  return eds.map(e=>{
+  // 既存ISBNの誤分類は警告だけ。写真・手入力の番号や蔵書そのものは変更しない。
+  const conflicts=books.filter(b=>mkey(b.series||'')===mk).filter(b=>{
+    const records=out.filter(x=>x.isbn===b.isbn);
+    return records.length&&!records.some(x=>mkey(x.series||'')===mk&&x.vol===b.vol);
+  });
+  if(conflicts.length&&!error){ error=new Error('登録済みのISBNに別シリーズ・巻の書誌があります。該当本の「シリーズ・巻を確認」で内容を確認してください'); error.name='SeriesMismatchError'; }
+  lastError=error;
+  const eds=splitEditions(exact);
+  const unresolved=exact.filter(x=>!x.vol&&x.volumeAmbiguous);
+  if(unresolved.length&&!error){error=new Error('巻番号を確定できない記録があります。候補を確認してください。新刊の確認は完了していません');error.name='UnresolvedVolumesError';}
+  lastError=error;
+  const result=eds.map(e=>{
     const vols=new Map();
-    e.items.forEach(x=>{ if(!vols.has(x.vol)) vols.set(x.vol,x); });  // 同じ巻の別刷りは1つでよい
+    e.items.forEach(x=>{ if(x.vol&&!vols.has(x.vol)) vols.set(x.vol,x); });
     return {ak:e.ak, pk:e.pk, author:e.author, publisher:e.publisher,
             label:edLabel(e), count:vols.size,
-            items:[...vols.values()].sort((a,b)=>a.vol-b.vol)};
+            unplaced:dedupe(e.items.filter(x=>!x.vol&&x.volumeAmbiguous)),items:[...vols.values()].sort((a,b)=>a.vol-b.vol)};
   }).sort((a,b)=>b.count-a.count);
+  Object.defineProperty(result,'error',{value:error}); return result;
 }
 /* ══ 外伝・スピンオフ ══
    「オーバーロード」で調べると本編以外に
@@ -685,16 +955,17 @@ async function searchSeriesAll(name,fresh){
    「関連作品」として前に出し、そうでないものは「同じ名前の別作品」として後ろに置く。 */
 const authSet=s=>new Set(String(s||'').split(/[、,\/／]/)
   .map(a=>skey(a.replace(/\s*(著|作|画|原作|イラスト|漫画)\s*$/,''))).filter(Boolean));
-async function searchRelated(name,author){
-  lastError=null;
-  const q=mainTitle(name), qk=skey(q);
+async function searchRelated(name,author,signal){
+  let error=null;
+  const q=seriesQuery(name), qk=mkey(name);
   let out=[];
-  try{ out=await ndlQuery({title:q,cnt:500}); }catch(e){ lastError=e; }
+  try{ out=await ndlSeriesQuery({title:q,signal}); error=queryIssue(out); }catch(e){ if(isCancelled(e,signal)) throw e; error=e; }
+  checkSignal(signal); lastError=error;
   const mine=authSet(author);
   const byT=new Map();
   out.forEach(x=>{
     const p=seriesOf(x), s=mainTitle(p.series||x.title||'');
-    const t=skey(s);
+    const t=mkey(s);
     // 本編そのものは除く。作品名が前に付いているものだけを関連とみなす
     if(!t||t===qk||t.indexOf(qk)!==0) return;
     if(!byT.has(t)) byT.set(t,{title:s, items:[], auth:new Set()});
@@ -708,39 +979,69 @@ async function searchRelated(name,author){
     const shared=[...g.auth].some(a=>mine.has(a));
     return {title:g.title, shared, count:vols.size||g.items.length,
             author:(g.items[0]||{}).author||'',
-            items:vols.size?[...vols.values()].sort((a,b)=>a.vol-b.vol):g.items};
+            unplaced:dedupe(g.items.filter(x=>!x.vol&&x.volumeAmbiguous)),items:vols.size?[...vols.values()].sort((a,b)=>a.vol-b.vol):g.items};
   }).sort((a,b)=>(b.shared?1:0)-(a.shared?1:0)||b.count-a.count);
 }
 
-/* 1本の巻リストが欲しい呼び出し向け。巻を最も多く持つ版を本編とみなすが、
-   呼び出し側が著者を知っているとき（棚の束から探すとき）はその版に合わせる。
-   本編に無い巻は他の版から補う（従来と同じふるまい）。 */
-async function searchSeries(name,prefer,fresh){
-  const eds=await searchSeriesAll(name,fresh);
-  if(!eds.length) return [];
-  const main=(prefer&&(eds.find(e=>e.ak+'|'+e.pk===prefer)||eds.find(e=>e.ak===prefer)))||eds[0];
-  const vols=new Map();
-  [main,...eds.filter(e=>e!==main)].forEach(e=>
-    e.items.forEach(x=>{ if(!vols.has(x.vol)) vols.set(x.vol,x); }));
-  return [...vols.values()].sort((a,b)=>a.vol-b.vol);
+/* 新刊は選択した版だけ。版が曖昧なら別版の候補を選んでもらい、蔵書は動かさない。 */
+function selectEdition(eds,prefer,name){
+  const [ak,pk]=String(prefer||'').split('|');
+  const exact=eds.filter(e=>e.ak===ak&&e.pk===(pk||''));
+  let main=exact.length===1?exact[0]:null;
+  if(!main){
+    const owned=new Set(books.filter(b=>mkey(b.series||'')===mkey(name)&&akey(b.author)===ak
+      &&(!pk||pkey(b.publisher)===pk)).map(b=>b.isbn));
+    const matches=eds.filter(e=>e.items.some(b=>owned.has(b.isbn)));
+    if(matches.length===1) main=matches[0];
+  }
+  if(!eds.length){ const out=[]; out.editions=[]; return out; }
+  if(!main){ const e=new Error('版を特定できませんでした。別の版・出版社の候補を確認してください'); e.name='EditionAmbiguousError'; e.editions=eds; throw e; }
+  const out=main.items.slice(); out.editions=eds.filter(e=>e!==main); return out;
+}
+async function searchSeries(name,prefer,fresh,signal,session){
+  const key=mainTitle(name);
+  let promise=session&&session.get(key);
+  if(!promise){ promise=searchSeriesAll(name,fresh,signal); if(session) session.set(key,promise); }
+  const eds=await promise; checkSignal(signal);
+  if(eds.error) throw eds.error;
+  return selectEdition(eds,prefer,name);
 }
 
 async function add(isbn,opts){
   opts=opts||{};
+  if(store.blocked.has(KEY)){ toast('元の保存データを保護しています。復旧するまで登録できません',true); return null; }
   if(books.some(b=>b.isbn===isbn)){ if(!opts.quiet) toast('この本はもう棚にあります',true); return null; }
   if(!opts.quiet) toast('調べています…');
   // 検索結果から入れるときは書誌がもう手元にある。1冊ずつ引き直さない
-  const b=opts.rec ? Object.assign({},opts.rec) : await fetchByISBN(isbn);
-  if(!b){ if(!opts.quiet) toast('この ISBN の情報が見つかりません',true); return null; }
+  const b=opts.rec ? Object.assign({},opts.rec) : await fetchByISBN(isbn,opts.signal);
+  if(!b){ if(!opts.quiet) toast(lastError?errText(lastError):'この ISBN の情報が見つかりません',true); return null; }
+  // 通信を待っている間に別の登録が完了することがある（USB連続読取など）。
+  if(books.some(x=>x.isbn===isbn)) return null;
   Object.keys(b).forEach(k=>{ if(k[0]==='_') delete b[k]; });   // 表示用の作業フィールドは保存しない
   Object.assign(b,seriesOf(b),{added:Date.now(),
     own:opts.own||'paper', status:'stock', anime:false, rate:0, place:'', note:''});
-  books.unshift(b);
+  if(opts.signal&&opts.signal.aborted) return null;
+  if(!await changeBooks(current=>(opts.signal&&opts.signal.aborted)||current.some(x=>x.isbn===isbn)?null:[b,...current])) return null;
   logAct('追加',`${b.title}｜${ownLabel(b.own)}`);
-  /* まとめて入れるときは defer を立て、呼び出し側が最後に1回だけ保存・描画する。
-     1冊ごとに棚全体を書き出して描き直すと、巻数ぶん二乗で遅くなる */
-  if(!opts.defer){ await save(); render(); }
+  render();
   return b;
+}
+
+async function addMany(records,own){
+  let got=[];
+  const ok=await changeBooks(current=>{
+    const seen=new Set(current.map(b=>b.isbn)); got=[];
+    for(const rec of records){
+      if(seen.has(rec.isbn)) continue;
+      const b=Object.assign({},rec,seriesOf(rec),{added:Date.now(),own:own||'paper',status:'stock',anime:false,rate:0,place:'',note:''});
+      Object.keys(b).forEach(k=>{ if(k[0]==='_') delete b[k]; });
+      got.push(b); seen.add(b.isbn);
+    }
+    return got.length?[...got].reverse().concat(current):current.slice();
+  });
+  if(!ok) return null;
+  got.forEach(b=>logAct('追加',`${b.title}｜${ownLabel(b.own)}`));
+  render(); return got;
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -777,7 +1078,7 @@ function splitEditions(items){
       if(!byP.has(p)) byP.set(p,[]);
       byP.get(p).push(x); });
     if(byP.size<2) return whole();
-    const gs=[...byP.values()].map(l=>({l, vols:new Set(l.map(x=>x.vol))}));
+    const gs=[...byP.values()].map(l=>({l, vols:new Set(l.map(x=>x.vol).filter(Boolean))}));
     let overlap=false;
     for(let i=0;i<gs.length&&!overlap;i++)
       for(let j=i+1;j<gs.length&&!overlap;j++)
@@ -798,9 +1099,7 @@ const edLabel=e=>(e.author||'').split(/[、,\/／]/)[0].trim()
 let buildCache=null;
 function build(list){
   if(list===books&&buildCache) return buildCache;
-  /* 束ねる鍵の題名は主題名（副題を落としたもの）にする。
-     「電波教師」と「電波教師 : HE IS A ULTIMATE TEACHER」は
-     国会図書館の見出しが違うだけで同じ作品なので、1つの棚に並べたい。 */
+  /* 読み仮名・確認済み別見出しだけを揃える。短編集・外伝の副題は残す。 */
   const m=new Map();
   list.forEach(b=>{
     const k=b.series?('S'+mkey(b.series)+'|'+akey(b.author)):('B'+b.isbn);
@@ -844,6 +1143,7 @@ function build(list){
   gs.forEach(g=>{
     g.items.sort((a,b)=>(a.vol||0)-(b.vol||0)||(a.added||0)-(b.added||0));
     g.by=new Map(); g.extra=[];
+    g.unplaced=g.items.filter(x=>!x.vol);
     // 同じ巻が2冊以上あるとき、はみ出したぶんは捨てずに持つ（棚から消えたように見えるため）
     g.items.filter(x=>x.vol).forEach(x=>{
       g.by.has(x.vol)?g.extra.push(x):g.by.set(x.vol,x); });
@@ -901,7 +1201,13 @@ function applySort(gs){
            .map(z=>z[2]);
 }
 
-let rendered=false;
+let rendered=false, shelfLimit=60;
+const bookSearch=new WeakMap();
+function searchText(b){
+  let text=bookSearch.get(b);
+  if(text===undefined){ text=norm(b.title+' '+b.author+' '+b.publisher+' '+(b.series||'')+' '+(b.place||'')+' '+(b.note||'')).toLowerCase(); bookSearch.set(b,text); }
+  return text;
+}
 function render(){
   // 2回目以降は出現アニメを止める（絞り込みや保存のたびに全カードが跳ねない）
   if(rendered) document.getElementById('main').classList.add('still');
@@ -921,8 +1227,7 @@ function render(){
   // 絞り込みは「どの作品を出すか」だけに効かせる（さもないと最大巻数が縮んで穴が増える）
   const hit=b=>{
     // norm() を通して全角半角ゆれを吸収する（「Re:ゼロ」で「Ｒｅ：ゼロ」も当てる）
-    if(filter && !norm(b.title+' '+b.author+' '+b.publisher+' '+(b.series||'')
-      +' '+(b.place||'')+' '+(b.note||'')).toLowerCase().includes(filter)) return false;
+    if(filter && !searchText(b).includes(filter)) return false;
     if(['paper','digital','none'].includes(mode)) return b.own===mode;
     if(mode==='read')  return b.status==='read';
     if(mode==='anime') return !!b.anime;
@@ -944,13 +1249,15 @@ function render(){
   }
 
   const series=applySort(gs.filter(g=>g.isSeries)), singles=applySort(gs.filter(g=>!g.isSeries));
+  const singleBooks=singles.flatMap(g=>g.items), totalRows=series.length+singleBooks.length;
+  const visibleSeries=series.slice(0,shelfLimit), visibleSingles=singleBooks.slice(0,Math.max(0,shelfLimit-series.length));
   let html=(navigator.onLine===false
     ? `<div class="offline">オフラインです。棚は見られますが、検索と新刊の確認はできません</div>` : '')
     + newHint() + exportHint();
 
   if(series.length){
     html+=`<div class="h">シリーズ ${series.length}</div>`;
-    series.forEach(g=>{
+    visibleSeries.forEach(g=>{
       const head=[...g.by.values()].pop()||g.items[0];
       const nv=newOf(g);
       let strip='';
@@ -979,22 +1286,34 @@ function render(){
     html+=`<div class="h">単巻 ${singles.reduce((n,g)=>n+g.items.length,0)}</div><div class="grid">`;
     // 巻の無い本が同じ束に複数入ることがある（手編集した読み込みなど）。全部描く
     let d=0;
-    singles.forEach(g=>g.items.forEach(b=>{
-      html+=`<button class="book" data-isbn="${b.isbn}" style="animation-delay:${Math.min(d++,10)*20}ms">
+    visibleSingles.forEach(b=>{
+      html+=`<button class="book" data-isbn="${esc(b.isbn)}" style="animation-delay:${Math.min(d++,10)*20}ms">
         <div class="jacket ${b.own==='none'?'ghost':''}">${jacketImg(b)}${pin(b)}</div>
         <div class="t">${esc(b.title)}</div>
         <div class="a">${esc(b.author)}</div></button>`;
-    }));
+    });
     html+=`</div><div class="rail"></div>`;
   }
 
+  if(totalRows>shelfLimit) html+=`<button class="bulk" id="morecards">続きを表示（残り${totalRows-shelfLimit}件）</button>`;
   html+=`<div class="legend">
     <span><i class="key" style="background:linear-gradient(180deg,#C9A34E,#8A7133)"></i>紙</span>
     <span><i class="key" style="border:1.5px solid #C9A34E"></i>電子</span>
     <span><i class="key" style="background:linear-gradient(180deg,#5E9E8C,#3F7466)"></i>読了</span>
     <span><i class="key" style="border:1px solid #9285C8"></i>アニメ</span>
     <span><i class="key" style="border:1px dashed #D2604A"></i>未登録</span></div>`;
-  main.innerHTML=html;
+  reconcileMain(main,html);
+}
+function reconcileMain(main,html){
+  const template=document.createElement('template'); template.innerHTML=html;
+  const key=el=>el.dataset.g?'S'+el.dataset.g:'B'+el.dataset.isbn;
+  const old=new Map([...main.querySelectorAll('[data-g],[data-isbn]')].map(el=>[key(el),el]));
+  template.content.querySelectorAll('[data-g],[data-isbn]').forEach(el=>{
+    const signature=el.outerHTML, previous=old.get(key(el));
+    if(previous&&previous._renderHTML===signature) el.replaceWith(previous);
+    else el._renderHTML=signature;
+  });
+  main.replaceChildren(template.content);
 }
 const ymd=t=>{ const d=new Date(t);
   return `${d.getFullYear()}/${d.getMonth()+1}/${d.getDate()}`; };
@@ -1036,17 +1355,23 @@ const aCover=isbn=>{ const t=isbn10from13(isbn);
   return t?`https://images-na.ssl-images-amazon.com/images/P/${t}.09.LZZZZZZZ.jpg`:''; };
 const gCover=isbn=>/^\d{13}$/.test(isbn||'')
   ? `https://books.google.com/books/content?vid=ISBN${isbn}&printsec=frontcover&img=1&zoom=1` : '';
-const coverSrcs=b=>[...new Set([b.cover,aCover(b.isbn),gCover(b.isbn)].filter(Boolean))];
+const coverKnown=new Map(), coverFailed=new Map(), coverUpdates=new Map();
+const coverSrcs=b=>{
+  const known=coverKnown.get(b.isbn), first=known&&known.original===(b.cover||'')?known.src:b.cover;
+  return [...new Set([first,b.cover,aCover(b.isbn),gCover(b.isbn)].filter(Boolean))]
+    .filter(url=>Date.now()-(coverFailed.get(url)||0)>300000);
+};
 
 function jacketImg(b){
   const s=coverSrcs(b);
   if(!s.length) return `<div class="fallback">${esc(b.title.slice(0,26))}</div>`;
   return `<img src="${esc(s[0])}" alt="" loading="lazy" decoding="async" data-t="${esc(b.title.slice(0,26))}"
-    data-b="${esc(b.isbn)}"
+    data-b="${esc(b.isbn)}" data-original="${esc(b.cover||'')}"
     data-n="${esc(s.slice(1).map(encodeURIComponent).join(' '))}" onload="ckCover(this)" onerror="nextCover(this)">`;
 }
 // 次の候補へ送る。候補が尽きたら文字（検索結果では灰色の枠）に落とす
 function nextCover(el){
+  coverFailed.set(el.src,Date.now());
   // 候補URLは encodeURIComponent 済み（利用者が入れたURLに空白があっても壊れない）
   const rest=(el.dataset.n||'').split(' ').filter(Boolean);
   if(rest.length){
@@ -1064,10 +1389,19 @@ function ckCover(el){
   /* 表示に成功したURLを本に書き戻す。書かないと、描画のたびに
      同じ当てずっぽう（Amazon→Google）の失敗をやり直すことになる。
      検索結果の画像（data-b なし）は棚の本ではないので触らない */
-  const b=el.dataset.b&&books.find(x=>x.isbn===el.dataset.b);
-  if(b&&b.cover!==el.src){
-    b.cover=el.src;
-    clearTimeout(coverT); coverT=setTimeout(save,1200);   // 一斉に読み終わるのでまとめて書く
+  const isbn=el.dataset.b;
+  if(isbn){
+    const original=el.dataset.original||'', src=el.src;
+    coverKnown.set(isbn,{original,src});
+    if(original===src) return;
+    coverUpdates.set(isbn,{original,src});
+    clearTimeout(coverT); coverT=setTimeout(async()=>{
+      const updates=new Map(coverUpdates); coverUpdates.clear();
+      await changeBooks(current=>current.map(b=>{
+        const update=updates.get(b.isbn);
+        return update&&(b.cover||'')===update.original?Object.assign({},b,{cover:update.src}):b;
+      }));
+    },1200);
   }
 }
 function fbCover(el){
@@ -1088,17 +1422,20 @@ document.getElementById('sortbtn').onclick=()=>{
     <div class="menu">${SORTS.map(s=>
       `<button data-s="${s.id}"${s.id===sortBy?' class="on"':''}>${s.label}${
         s.id===sortBy&&sortDir<0?'（逆順）':''}</button>`).join('')}</div>`);
-  card.querySelectorAll('[data-s]').forEach(el=>el.onclick=()=>{
-    if(sortBy===el.dataset.s) sortDir=-sortDir;
-    else{ sortBy=el.dataset.s; sortDir=1; }
-    saveMeta();
+  card.querySelectorAll('[data-s]').forEach(el=>el.onclick=async()=>{
+    if(!await changeMeta(m=>{
+      if(m.sort===el.dataset.s) m.dir=-m.dir;
+      else{ m.sort=el.dataset.s; m.dir=1; }
+      return m;
+    })) return;
     closeSheet(); render();
   });
 };
 document.getElementById('chips').addEventListener('click',e=>{
-  const c=e.target.closest('.chip'); if(!c) return; mode=c.dataset.m; render();
+  const c=e.target.closest('.chip'); if(!c) return; mode=c.dataset.m; shelfLimit=60; render();
 });
 document.getElementById('main').addEventListener('click',e=>{
+  if(e.target.closest('#morecards')){ shelfLimit+=60; render(); return; }
   if(e.target.closest('#exphint')) return exportJSON();
   if(e.target.closest('#newhint')){ openWith('<div class="lab">新刊</div>'); return checkNew(); }
   const s=e.target.closest('.series'); if(s) return openSeries(s.dataset.g);
@@ -1111,7 +1448,7 @@ const sheet=document.getElementById('sheet'), card=document.getElementById('card
    開くときに履歴を1つ積み、閉じるときに戻す。 */
 let sheetOpen=false;
 const openWith=h=>{
-  bulkSeq++; checkSeq++;     // 別の画面へ移ったら、裏で続いている調査は降ろす
+  cancelViewJobs(); bulkSeq++; checkSeq++; // 別画面の通信と応答を取り消す
   card.innerHTML=h; card.scrollTop=0;
   if(sheetOpen) return;
   sheetOpen=true; sheet.classList.add('on');
@@ -1123,7 +1460,7 @@ const openWith=h=>{
 let ignorePop=0;
 const closeSheet=fromPop=>{
   if(!sheetOpen) return;
-  sheetOpen=false; hid.on=false; bulkSeq++; checkSeq++; sheet.classList.remove('on');
+  cancelViewJobs(); sheetOpen=false; hid.on=false; bulkSeq++; checkSeq++; sheet.classList.remove('on');
   // 戻るキー由来のときは、履歴はもう戻っているので二重に戻さない
   if(!fromPop && history.state && history.state.sh){ ignorePop++; history.back(); }
 };
@@ -1148,6 +1485,7 @@ function openBook(isbn){
           :'<p class="meta">著者不明</p>'}
         <p class="meta">${esc(b.publisher)}${b.date?' / '+esc(dateLabel(b.date)):''}</p>
         ${b.series?`<p class="meta">${esc(b.series)}　第${b.vol}巻</p>`:''}
+        ${classificationIssue(b)?'<p class="meta" style="color:var(--alert)">題名の短編集・Ex表記と登録シリーズ・巻が一致していません。</p>':''}
         ${b.readAt?`<p class="meta">${ymd(b.readAt)} に読了</p>`:''}
         <p class="isbn">${/^\d{13}$/.test(b.isbn)?'ISBN '+b.isbn:'手入力'} · ${esc(b.src)}</p>
       </div></div>
@@ -1171,13 +1509,38 @@ function openBook(isbn){
     <div class="field"><input id="place" value="${esc(b.place)}" placeholder="寝室の棚 / 実家 / 段ボールA"></div>
     <div class="field"><textarea id="note" rows="2" placeholder="貸出中、続きが気になる、など">${esc(b.note)}</textarea></div>
     <div class="field"><input id="cov" value="${esc(b.cover)}" placeholder="表紙画像のURL（取れなかったとき用）"></div>
+    ${isISBN13(b.isbn)?`<div class="menu"><button id="seriescheck">ISBNでシリーズ・巻を確認</button></div>
+      <p class="meta">短編集・Ex・外伝が本編に混ざった場合はこちらで確認できます。確認だけでは棚は変わりません。</p>
+      <div id="seriesreview"></div>`:''}
 
     <div class="acts">
       <button class="del" id="del">棚から出す</button>
       <button class="save" id="ok">保存</button>
     </div>`);
 
-  let own=b.own, st=b.status||'stock', anime=!!b.anime, rate=b.rate||0;
+  let own=b.own, st=b.status||'stock', anime=!!b.anime, rate=b.rate||0, pendingSeries=null;
+  const seriescheck=document.getElementById('seriescheck');
+  if(seriescheck) seriescheck.onclick=async()=>{
+    const job=viewJob('book-series'), box=document.getElementById('seriesreview');
+    box.innerHTML='<p class="meta">ISBNの書誌を確認しています…</p>';
+    let rec=null;
+    try{
+      const items=await ndlQuery({isbn:b.isbn,cnt:5,fresh:true,signal:job.signal});
+      rec=items.find(x=>x.isbn===b.isbn);
+    }catch(e){ if(job.current()) box.innerHTML=`<p class="meta">${esc(errText(e))}</p>`; return; }
+    if(!job.current()) return;
+    if(!rec||!rec.series||!rec.vol||rec.volumeAmbiguous){ box.innerHTML='<p class="meta">ISBNに対応するシリーズ・巻番号を確定できませんでした。棚は変更していません。</p>'; return; }
+    box.innerHTML=`<p class="meta">現在：${esc(b.series||'シリーズなし')}／${b.vol||'巻不明'}<br>
+      ISBNの書誌：${esc(rec.series)}／${rec.vol}巻<br>${esc(rec.title)}</p>
+      <p class="meta">メモ・読書状態・持ちかた・ISBNは保持します。変更前の棚を控えに書き出せます。</p>
+      <div class="menu"><button id="seriesbackup">変更前の棚をJSONで書き出す</button>
+      <button id="serieschoose">このシリーズ・巻を保存候補にする</button></div>`;
+    document.getElementById('seriesbackup').onclick=exportJSON;
+    document.getElementById('serieschoose').onclick=()=>{
+      pendingSeries={title:rec.title,series:rec.series,vol:rec.vol,volumeLabel:rec.volumeLabel||'',volumeAmbiguous:false};
+      box.innerHTML=`<p class="meta">${esc(rec.series)}／${rec.vol}巻を変更候補にしました。下の「保存」で反映します。閉じれば変更しません。</p>`;
+    };
+  };
   const pick=(id,set)=>document.getElementById(id).onclick=e=>{
     const t=e.target.closest('[data-v]'); if(!t) return;
     set(t.dataset.v);
@@ -1204,23 +1567,41 @@ function openBook(isbn){
     closeSheet(); render();
   };
   document.getElementById('ok').onclick=async()=>{
-    setStatus(b,st);
-    Object.assign(b,{own,anime,rate,
+    // 保存が成功するまで棚は変えない。失敗しても編集画面を残し、そのまま再試行できる。
+    const fields=Object.assign({},pendingSeries,{own,anime,rate,
       place:document.getElementById('place').value.trim(),
       note:document.getElementById('note').value.trim(),
       cover:document.getElementById('cov').value.trim()});
-    await save(); render(); closeSheet(); toast('保存しました');
+    const status=st;
+    if(!await changeBooks(current=>{
+      if(!current.some(x=>x.isbn===b.isbn)) return null;
+      return current.map(x=>{
+        if(x.isbn!==b.isbn) return x;
+        const edited=Object.assign({},x,fields); setStatus(edited,status); return edited;
+      });
+    })){
+      toast('保存できませんでした。編集内容はこの画面に残っています。もう一度保存してください',true);
+      return;
+    }
+    render(); closeSheet(); toast('保存しました');
     logAct('変更',b.title);
   };
   document.getElementById('del').onclick=async()=>{
-    const i=books.indexOf(b);
-    if(i>=0) books.splice(i,1);
-    await save(); render(); closeSheet();
+    let i=-1, removed=b;
+    if(!await changeBooks(current=>{
+      i=current.findIndex(x=>x.isbn===b.isbn); if(i<0) return null;
+      removed=current[i]; return current.filter(x=>x.isbn!==b.isbn);
+    })) return;
+    render(); closeSheet();
     logAct('削除',b.title);
     // 押し間違いから戻れるようにする。確認ダイアログより速くて安全
     toast('棚から出しました',false,{label:'元に戻す',fn:async()=>{
-      books.splice(Math.min(Math.max(i,0),books.length),0,b);
-      await save(); render(); toast('戻しました');
+      if(!await changeBooks(current=>{
+        const next=current.slice();
+        if(!next.some(x=>x.isbn===b.isbn)) next.splice(Math.min(Math.max(i,0),next.length),0,removed);
+        return next;
+      })) return;
+      render(); toast('戻しました');
       logAct('削除取消',b.title);
     }});
   };
@@ -1233,7 +1614,7 @@ function openSeries(key){
   for(let i=1;i<=g.max;i++){
     const b=g.by.get(i);
     covers+=b
-      ? `<button data-o="${b.isbn}"><div class="c ${b.own==='none'?'ghost':''}">${jacketImg(b)}</div>
+      ? `<button data-o="${esc(b.isbn)}"><div class="c ${b.own==='none'?'ghost':''}">${jacketImg(b)}</div>
            <div class="num">${i}</div></button>`
       : `<button data-w="${i}"><div class="c"><div class="fallback" style="justify-content:center;
            padding:0;color:#D2604A;border:1px dashed rgba(210,96,74,.7)">${i}</div></div>
@@ -1245,10 +1626,12 @@ function openSeries(key){
       +(g.edition?'／'+g.edition:''))+' · ':''}所持${g.have}冊 · 最新${g.max}巻${
       g.buy.length?` · 未所持 ${g.buy.join('、')}`:''}</p>
     <div class="covers" style="margin-top:12px">${covers}</div>
+    ${g.unplaced.length?`<div class="lab">巻番号未確定の本</div><p class="meta">巻順には入れていません。書名・ISBNを確認できます。</p>
+      <div class="covers">${g.unplaced.map(b=>`<button data-o="${esc(b.isbn)}"><div class="c">${jacketImg(b)}</div><div class="num">巻番号未確定</div></button>`).join('')}</div>`:''}
     ${g.extra.length?`<div class="lab">同じ巻が重なっています</div>
       <p class="meta">別の版か、版元違いの重版かもしれません。</p>
       <div class="covers">${g.extra.map(b=>
-        `<button data-o="${b.isbn}"><div class="c ${b.own==='none'?'ghost':''}">${jacketImg(b)}</div>
+        `<button data-o="${esc(b.isbn)}"><div class="c ${b.own==='none'?'ghost':''}">${jacketImg(b)}</div>
            <div class="num">${b.vol}</div></button>`).join('')}</div>
       <div class="chips" style="margin-bottom:4px">${g.extra.map(b=>
         `<button class="chip" data-rmdup="${esc(b.isbn)}">${b.vol}巻の重なりを出す（${
@@ -1281,10 +1664,11 @@ function openSeries(key){
     const g2=build(books).find(x=>x.key===g.key);
     if(g2) openSeries(g2.key); else closeSheet();
   });
-  document.getElementById('done').onclick=e=>{
-    const on=toggleDone(g);
-    e.currentTarget.classList.toggle('on',on);
-    e.currentTarget.textContent=on?'完結にしている':'完結にする';
+  document.getElementById('done').onclick=async e=>{
+    const btn=e.currentTarget;
+    const on=await toggleDone(g); if(on===null) return;
+    btn.classList.toggle('on',on);
+    btn.textContent=on?'完結にしている':'完結にする';
     render();
     toast(on?'完結にしました。新刊の確認から外します':'完結を外しました');
   };
@@ -1308,10 +1692,11 @@ function openSeries(key){
    本編を棚に入れた人が次に探すのはたいてい外伝。
    選べば、その作品の巻ピッカーがそのまま開く。 */
 async function spinoffs(g){
-  const box=document.getElementById('found');
+  const job=viewJob('series'), box=document.getElementById('found');
   box.innerHTML='<p class="meta" style="padding:12px 0">関連する作品を探しています…</p>';
   let rel=[];
-  try{ rel=await searchRelated(g.series,g.author); }catch(e){}
+  try{ rel=await searchRelated(g.series,g.author,job.signal); }catch(e){}
+  if(!job.current()) return;
   if(!rel.length){
     box.innerHTML=lastError
       ? `<p class="meta" style="padding:12px 0;color:var(--alert)">${esc(errText(lastError))}。</p>`
@@ -1344,11 +1729,12 @@ async function spinoffs(g){
    全巻を調べて出し、足りない巻をタップで選ばせる。
    小説と漫画が同居する題名は、版（著者）を選んでから。 */
 async function volPicker(g,pre){
-  const box=document.getElementById('found');
+  const job=viewJob('series'), box=document.getElementById('found');
   box.innerHTML='<p class="meta" style="padding:12px 0">全巻を調べています…</p>';
   const tq0=performance.now();
-  let eds=[];
-  try{ eds=(await searchSeriesAll(g.series)).filter(e=>e.count>=1); }catch(e){}
+  let eds=[], issue=null;
+  try{ const found=await searchSeriesAll(g.series,false,job.signal); issue=found.error; eds=found.filter(e=>e.count>=1||(e.unplaced||[]).length); }catch(e){ issue=e; }
+  if(!job.current()) return;
   logAct('巻ピッカー',g.series,performance.now()-tq0);
   if(!eds.length){
     box.innerHTML=lastError
@@ -1365,6 +1751,7 @@ async function volPicker(g,pre){
   const sel=new Set(pre?[pre]:g.gaps);
   const draw=()=>{
     const ed=cur;
+    const unplaced=(ed.unplaced||[]).filter(x=>!books.some(b=>b.isbn===x.isbn));
     /* 「持っている」の判定は版ごとに。小説1〜4巻を持っていても、
        漫画版の1〜4巻はまだ持っていない（両方集める人がいる）。
        版元まで分かれている束では、版元も一致していなければ別の版として扱う。 */
@@ -1374,7 +1761,7 @@ async function volPicker(g,pre){
     const availSet=new Set(avail.map(x=>x.vol));
     [...sel].forEach(v=>{ if(!availSet.has(v)) sel.delete(v); });
     // 版が2つ以上あるときだけ、どれを入れるか選ばせる
-    const multi=eds.filter(e=>e.ak&&e.count>=2);
+    const multi=eds.filter(e=>e.count>=1);
     const edChips=multi.length>1
       ? `<div class="chips" style="margin:6px 0 2px">`+multi.map(e=>
           `<button class="chip ${ekey(e)===ekey(ed)?'on':''}" data-ed="${esc(ekey(e))}">${
@@ -1393,8 +1780,10 @@ async function volPicker(g,pre){
     const edVols=new Set(ed.items.map(x=>x.vol));
     const nowhere=g.gaps.filter(v=>!edVols.has(v));
     const elsewhere=nowhere.filter(v=>eds.some(e2=>e2!==ed&&e2.items.some(x=>x.vol===v)));
-    box.innerHTML=`<div class="lab">巻を選ぶ（見つかった${ed.count}巻・持っている巻は金）</div>`
+    box.innerHTML=(issue?`<p class="meta" style="color:var(--alert)">${esc(errText(issue))}</p>`:'')
+      +`<div class="lab">巻を選ぶ（見つかった${ed.count}巻・持っている巻は金）</div>`
       +edChips
+      +(unplaced.length?`<div class="lab">巻番号を確認できない記録</div><p class="meta">自動的に1巻にしません。書名・ISBNを確認して1冊ずつ登録できます。</p><div id="unplaced">${results(unplaced)}</div>`:'')
       +`<div class="strip pickgrid" style="margin-top:6px">${chips}</div>`
       +(nowhere.length?`<p class="meta" style="margin-top:8px">${
         esc(nowhere.join('、'))}巻はこの版に見あたりません。${
@@ -1408,8 +1797,9 @@ async function volPicker(g,pre){
         <div class="seg" id="vpo">${OWNS.map(o=>
           `<button data-v="${o.id}" class="${addOwn===o.id?'on':''}">${o.label}</button>`).join('')}</div>
         <button class="bulk" id="vgo">選んだ${sel.size}冊を入れる</button>`
-       :`<p class="meta" style="padding:10px 0">この版の巻はすべて棚にあります。</p>`);
+       :`<p class="meta" style="padding:10px 0">今回取得できた、この版の巻は棚にあります。</p>`);
     box.onclick=async e=>{
+      if(e.target.closest('#unplaced')) return;
       const vb=e.target.closest('[data-vol]');
       if(vb){ const v=+vb.dataset.vol; sel.has(v)?sel.delete(v):sel.add(v); draw(); return; }
       const ec=e.target.closest('[data-ed]');
@@ -1422,10 +1812,8 @@ async function volPicker(g,pre){
       if(e.target.closest('#vgo')){
         if(!sel.size){ toast('巻をタップして選んでください',true); return; }
         const want=avail.filter(x=>sel.has(x.vol));
-        let n=0; const got=[];
-        for(const x of want){ const b=await add(x.isbn,{own:addOwn,quiet:true,rec:x,defer:true});
-          if(b){ n++; got.push(b); } }
-        await save(); render();
+        const got=await addMany(want,addOwn); if(!got) return;
+        const n=got.length;
         fillCoversFor(got);      // 表紙はあとから届けばよい。待たせない
         logAct('巻を追加',`${g.series}｜${n}冊｜${ownLabel(addOwn)}`);
         toast(`${n}冊を${ownLabel(addOwn)}で入れました`);
@@ -1435,6 +1823,7 @@ async function volPicker(g,pre){
         if(g2) openSeries(g2.key); else closeSheet();
       }
     };
+    const unplacedBox=document.getElementById('unplaced');if(unplacedBox) wire(unplacedBox,unplaced,'',addOwn);
   };
   draw();
 }
@@ -1445,18 +1834,25 @@ async function volPicker(g,pre){
 async function removeMany(list,label){
   if(!list.length){ toast('選んでください',true); return 0; }
   // どこに入っていたかを覚えておき、戻すときは元の位置に差し直す
-  const backup=list.map(b=>({b,i:books.indexOf(b)})).sort((a,b)=>a.i-b.i);
-  const kill=new Set(list);
-  books=books.filter(x=>!kill.has(x));
-  await save(); render();
-  logAct('まとめて削除',`${label}｜${list.length}冊`);
-  toast(`${list.length}冊を棚から出しました`,false,{label:'元に戻す',fn:async()=>{
-    backup.forEach(({b,i})=>books.splice(Math.min(i,books.length),0,b));
-    await save(); render();
-    logAct('削除取消',`${label}｜${list.length}冊`);
-    toast(`${list.length}冊を戻しました`);
+  let backup=[];
+  const kill=new Set(list.map(b=>b.isbn));
+  if(!await changeBooks(current=>{
+    backup=current.map((b,i)=>({b,i})).filter(x=>kill.has(x.b.isbn));
+    return backup.length?current.filter(x=>!kill.has(x.isbn)):null;
+  })) return 0;
+  render();
+  logAct('まとめて削除',`${label}｜${backup.length}冊`);
+  toast(`${backup.length}冊を棚から出しました`,false,{label:'元に戻す',fn:async()=>{
+    if(!await changeBooks(current=>{
+      const next=current.slice(), seen=new Set(next.map(b=>b.isbn));
+      backup.forEach(({b,i})=>{ if(!seen.has(b.isbn)){ next.splice(Math.min(Math.max(i,0),next.length),0,b); seen.add(b.isbn); } });
+      return next;
+    })) return;
+    render();
+    logAct('削除取消',`${label}｜${backup.length}冊`);
+    toast(`${backup.length}冊を戻しました`);
   }});
-  return list.length;
+  return backup.length;
 }
 
 /* 巻ピッカーの裏返し。持っている巻をタップで選んで外す。
@@ -1505,9 +1901,13 @@ function volRemover(g){
    棚に無い巻は飛ばす（未登録の巻を勝手に作らない） */
 async function bulkApply(g,upto,fn,label){
   let n=0;
-  for(let i=1;i<=upto;i++){ const b=g.by.get(i); if(b){ fn(b); n++; } }
-  if(!n){ toast('その範囲に棚の本がありません',true); return; }
-  await save(); render(); closeSheet();
+  const selected=new Set([...g.by.entries()].filter(([v])=>v>=1&&v<=upto).map(([,b])=>b.isbn));
+  if(!selected.size){ toast('その範囲に棚の本がありません',true); return; }
+  if(!await changeBooks(current=>current.map(b=>{
+    if(!selected.has(b.isbn)) return b;
+    const edited=Object.assign({},b); fn(edited); n++; return edited;
+  }))) return;
+  render(); closeSheet();
   toast(`${label}変更しました（${n}冊）`);
 }
 
@@ -1541,20 +1941,23 @@ function openFind(q){
   const chipsOf=list=>list.map(x=>
     `<button class="chip" data-q="${esc(x.q)}">${esc(x.label)}</button>`).join('');
   const preset0=presets().map(x=>({q:x,label:x}));
-  let sugT=0, sugSeq=0;
+  let sugT=0, sugSeq=0, findSeq=0;
   const sugCache=new Map();
   document.getElementById('fq').addEventListener('input',()=>{
-    clearTimeout(sugT);
+    clearTimeout(sugT); sugSeq++; findSeq++;
+    const job=viewJob('suggest'); viewJob('find');
     const v=norm(document.getElementById('fq').value).trim();
-    if(v.length<2||/^[\d\s\-]+$/.test(v)){ fpre.innerHTML=chipsOf(preset0); return; }
+    fpre.innerHTML=chipsOf(preset0);
+    if(v.length<2||/^[\d\s\-]+$/.test(v)) return;
     sugT=setTimeout(async()=>{
-      const seq=++sugSeq;
+      const seq=sugSeq; if(!job.current()) return;
       let items=sugCache.get(v);
       if(!items){
-        try{ items=await ndlQuery({title:v,cnt:25}); }catch(e){ items=[]; }
-        sugCache.set(v,items);
+        try{ items=await ndlQuery({title:v,cnt:25,signal:job.signal});
+          if(job.current()&&items.length) sugCache.set(v,items);
+        }catch(e){ items=[]; }
       }
-      if(seq!==sugSeq) return;              // 打ち直しで古くなった応答は捨てる
+      if(seq!==sugSeq||!job.current()) return;
       const seen=new Set(), out=[];
       rank(items,v).forEach(x=>{
         const nm=x.series||x.title, kk=skey(nm);
@@ -1584,25 +1987,30 @@ function openFind(q){
   const run=async()=>{
     const raw=document.getElementById('fq').value.trim();
     if(!raw) return;
+    clearTimeout(sugT); sugSeq++; viewJob('suggest');
+    const job=viewJob('find'), seq=++findSeq;
     const box=document.getElementById('fres');
     const digits=raw.replace(/\D/g,'');
     if(digits.length===13){
       if(!isISBN13(digits)){ toast('13桁の ISBN として正しくありません',true); return; }
       if(books.some(b=>b.isbn===digits)){ toast('この本はもう棚にあります',true); return; }
       box.innerHTML='<p class="meta" style="padding:12px 0">調べています…</p>';
-      const b=await add(digits,{own:addOwn,quiet:true});
+      let b=null;
+      try{ b=await add(digits,{own:addOwn,quiet:true,signal:job.signal}); }catch(e){}
+      if(seq!==findSeq||!job.current()) return;
       if(b){ closeSheet(); toast(`『${b.title.slice(0,16)}』を追加`); }
-      else box.innerHTML='<p class="meta" style="padding:12px 0">追加できませんでした。</p>';
+      else box.innerHTML=noHits(raw);
       return;
     }
     box.innerHTML='<p class="meta" style="padding:12px 0">探しています…</p>';
     const t0=performance.now();
     let items=[];
-    try{ items=(await searchBooks(raw)).filter(x=>!books.some(b=>b.isbn===x.isbn)); }catch(e){}
+    try{ items=(await searchBooks(raw,job.signal)).filter(x=>!books.some(b=>b.isbn===x.isbn)); }catch(e){}
+    if(seq!==findSeq||!job.current()) return;
     logAct('検索',raw,performance.now()-t0);
     items=sortByVolume(items);
     box.innerHTML=items.length
-      ? bulkBar(items,raw)+results(items,true,raw)
+      ? (lastError?`<p class="meta" style="color:var(--alert)">${esc(errText(lastError))}</p>`:'')+bulkBar(items,raw)+results(items,true,raw)
       : noHits(raw);
     wire(box,items,raw);
   };
@@ -1619,9 +2027,9 @@ function openFind(q){
 function sortByVolume(items){
   const withS=items.map(x=>Object.assign({},x,seriesOf(x)));
   const order=new Map();
-  withS.forEach(x=>{ const k=skey(x.series||x.title);
+  withS.forEach(x=>{ const k=mkey(x.series||x.title);
     if(!order.has(k)) order.set(k,order.size); });
-  return withS.map((x,i)=>[order.get(skey(x.series||x.title)), x.vol||0, i, x])
+  return withS.map((x,i)=>[order.get(mkey(x.series||x.title)), x.vol||0, i, x])
     .sort((a,b)=>a[0]-b[0]||a[1]-b[1]||a[2]-b[2]).map(z=>z[3]);
 }
 let bulkList=[], bulkEds=[];   // bulkEds＝検索結果から組んだ全版。追加時に引き直さないための控え
@@ -1667,7 +2075,7 @@ function bulkBar(items,q){
     +`<div class="field" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0 0">
       <select id="bfrom">${vols.map(v=>`<option value="${v}">${v}</option>`).join('')}</select>
       <span class="meta" style="white-space:nowrap">巻から</span>
-      <select id="bto"><option value="all">最後まで（見つかった全巻）</option>${
+      <select id="bto"><option value="all">取得できた最後の巻まで</option>${
         vols.slice().reverse().map(v=>`<option value="${v}">${v}巻</option>`).join('')}</select>
       <span class="meta" style="white-space:nowrap">を</span>
     </div>
@@ -1689,7 +2097,29 @@ const META='bookshelf:meta';
 let meta={done:[],sort:'added',dir:1,exportAt:0,exportN:0,newAt:0,newVols:{},series:{}};
 let doneKeys=new Set();
 // 読み込み済みの値を受け取る形にして、起動時に books と並列で読めるようにする
+function validateMeta(m){
+  // JSONとして読めても、設定の形が壊れていると newOf() などで描画が止まる。
+  // 元データは起動側で保護し、設定だけを一時的な既定値で表示する。
+  if(m!=null){
+    if(typeof m!=='object'||Array.isArray(m)) throw new Error('設定の形式が不正です');
+    if(m.done!=null&&(!Array.isArray(m.done)||m.done.some(k=>typeof k!=='string')))
+      throw new Error('完結の印が不正です');
+    const validVols=vs=>Array.isArray(vs)&&vs.every(v=>Number.isInteger(v)&&v>=1&&v<=200);
+    if(m.series!=null){
+      if(typeof m.series!=='object'||Array.isArray(m.series)) throw new Error('新刊記録が不正です');
+      Object.values(m.series).forEach(v=>{
+        if(!v||typeof v!=='object'||Array.isArray(v)||(v.newVols!=null&&!validVols(v.newVols)))
+          throw new Error('新刊記録が不正です');
+      });
+    }
+    if(m.newVols!=null){
+      if(typeof m.newVols!=='object'||Array.isArray(m.newVols)||Object.values(m.newVols).some(v=>!validVols(v)))
+        throw new Error('旧新刊記録が不正です');
+    }
+  }
+}
 function loadMeta(m){
+  validateMeta(m);
   if(m&&typeof m==='object') Object.assign(meta,m);
   else{
     // 旧形式（localStorage 直書き）からの引き継ぎ
@@ -1738,10 +2168,9 @@ function logAct(type,detail,ms){
    版が分かれていない束の鍵は従来のままなので、既に付けた印は保たれる。 */
 const gkey=g=>skey(g.series||'')+'|'+akey(g.author)+(g.edition?'|'+pkey(g.edition):'');
 const isDone=g=>doneKeys.has(gkey(g));
-function toggleDone(g){
+async function toggleDone(g){
   const k=gkey(g);
-  doneKeys.has(k)?doneKeys.delete(k):doneKeys.add(k);
-  saveMeta();
+  if(!await changeMeta(m=>{ const keys=new Set(m.done); keys.has(k)?keys.delete(k):keys.add(k); m.done=[...keys]; return m; })) return null;
   logAct(doneKeys.has(k)?'完結にした':'完結を外した',g.series||'');
   return doneKeys.has(k);
 }
@@ -1799,7 +2228,7 @@ function openBulkInput(){
     <div class="lab">持ちかた</div>
     <div class="seg" id="bo">${OWNS.map(o=>
       `<button data-v="${o.id}" class="${addOwn===o.id?'on':''}">${o.label}</button>`).join('')}</div>
-    <div id="bres"></div>
+    <div id="bres"></div><button class="ghost2" id="bcancel" hidden>調査を中止</button>
     <div class="acts"><button class="save" id="bgo">調べて巻を選ぶ</button></div>`);
   document.getElementById('bo').onclick=e=>{
     const t=e.target.closest('[data-v]'); if(!t) return;
@@ -1828,13 +2257,19 @@ function openBulkInput(){
    入れてしまう事故を、選ばせることで潰す。 */
 let bulkFound=[], bulkSeq=0;
 async function runBulkInput(){
-  const seq=++bulkSeq;      // 調べ直し・画面を閉じたときに、古い走査を黙って降ろすための世代
+  const job=viewJob('bulk'), seq=++bulkSeq;
   const box=document.getElementById('bres');
   const go=document.getElementById('bgo');
   const lines=document.getElementById('blines').value.split(/\r?\n/)
     .map(parseLine).filter(Boolean);
   if(!lines.length){ toast('1行に1作品ずつ書いてください',true); return; }
   go.disabled=true;
+  const cancel=document.getElementById('bcancel'); cancel.hidden=false;
+  cancel.onclick=()=>{
+    bulkSeq++; job.cancel(); go.disabled=false; cancel.hidden=true;
+    const btn=document.getElementById('bcommit');
+    if(btn){ btn.disabled=true; btn.textContent='調査を中止しました。入力を残したまま調べ直せます'; }
+  };
   bulkFound=[];
   // 選んでいる版（著者）の巻。「両方」は小説と漫画の同じ巻を両方数える
   const itemsOf=r=>{
@@ -1860,6 +2295,8 @@ async function runBulkInput(){
           <option value="both"${r.edSel==='both'?' selected':''}>全部いれる</option></select></div>`
       : '';
     const items=itemsOf(r);
+    if(!items.length) return `<div class="lab">${esc(r.name)}</div>`+edSel
+      +`<p class="meta" style="color:var(--alert)">${esc(r.eds.error?errText(r.eds.error):'巻番号を確定できる候補がありません')}。「探す」で書名・ISBNを確認してください。</p>`;
     const vols=[...new Set(items.map(x=>x.vol))].sort((a,b)=>a-b);
     // 題名に書いた範囲は初期値として反映する
     const from=r.range?(r.range.list?Math.min(...r.range.list):r.range.from):vols[0];
@@ -1883,12 +2320,12 @@ async function runBulkInput(){
     }
     return `<div class="lab">${esc(items[0]&&items[0].series||r.name)}
         <span style="float:right" id="bn${r.i}"></span></div>`
-      +edSel+note
+      +(r.err?`<p class="meta" style="color:var(--alert)">${esc(errText(r.eds.error))}</p>`:'')+edSel+note
       +`<div class="field" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <select data-bf="${r.i}">${vols.map(v=>
           `<option value="${v}"${v===from?' selected':''}>${v}</option>`).join('')}</select>
         <span class="meta" style="white-space:nowrap">巻から</span>
-        <select data-bt="${r.i}"><option value="all">最後まで（${vols[vols.length-1]}巻）</option>${
+        <select data-bt="${r.i}"><option value="all">取得できた最後（${vols[vols.length-1]}巻）</option>${
           vols.slice().reverse().map(v=>
           `<option value="${v}"${to===v?' selected':''}>${v}巻</option>`).join('')}</select>
         <span class="meta" style="white-space:nowrap">まで</span>
@@ -1929,17 +2366,14 @@ async function runBulkInput(){
   document.getElementById('bcommit').onclick=async()=>{
     const btn=document.getElementById('bcommit');
     btn.disabled=true; btn.textContent='入れています…';
-    const done=[]; let total=0; const got=[];
-    for(const r of bulkFound){
-      if(!r.eds.length){ done.push([r.name,'見つかりませんでした',false]); continue; }
-      const want=pickOf(r);
-      let n=0;
-      for(const x of want){ const b=await add(x.isbn,{own:addOwn,quiet:true,rec:x,defer:true});
-        if(b){ n++; got.push(b); } }
-      total+=n;
-      done.push([(itemsOf(r)[0]||{}).series||r.name, n?`${n}冊追加`:'追加できる巻なし', n>0]);
-    }
-    await save(); render();
+    const selected=bulkFound.map(r=>({r,want:pickOf(r)}));
+    const got=await addMany(selected.flatMap(x=>x.want),addOwn);
+    if(!got){ btn.disabled=false; btn.textContent='もう一度、選んだ巻を棚に入れる'; return; }
+    const ids=new Set(got.map(b=>b.isbn)), counted=new Set(), total=got.length;
+    const done=selected.map(({r,want})=>{
+      const n=want.filter(x=>ids.has(x.isbn)&&!counted.has(x.isbn)&&(counted.add(x.isbn),true)).length;
+      return [(itemsOf(r)[0]||{}).series||r.name,r.eds.length?(n?`${n}冊追加`:'追加できる巻なし'):'見つかりませんでした',n>0];
+    });
     fillCoversFor(got);          // 表紙はあとから届けばよい。待たせない
     logAct('まとめて入力',`${bulkFound.length}作品｜${total}冊`);
     box.innerHTML=`<div class="lab">結果</div><div class="rows">`
@@ -1949,26 +2383,27 @@ async function runBulkInput(){
     toast(total?`${total}冊を${ownLabel(addOwn)}で追加しました`:'追加できませんでした',!total);
   };
 
-  // ここから調査。配線を先に済ませてあるので、行が埋まった端から触れる
-  const t0=performance.now();
-  for(let i=0;i<lines.length;i++){
-    if(seq!==bulkSeq) return;                      // 調べ直しが始まっている。この走査は降りる
-    const {name,range}=lines[i];
-    const tq=performance.now();
-    let eds=[];
-    try{ eds=await searchSeriesAll(name); }catch(e){}
-    if(seq!==bulkSeq) return;                      // 待っている間に世代が変わった
-    const r={i, name, range, eds, edSel:eds[0]?eds[0].ak+'|'+eds[0].pk:null,
-             err:!eds.length&&!!lastError, dirty:false};
-    bulkFound.push(r);
-    const row=document.getElementById('brow'+i);   // シートが閉じられていたら描かないだけ
-    if(row) row.innerHTML=rowHTML(r);
-    counts();
-    const btn=document.getElementById('bcommit');
-    if(btn) btn.textContent=`調べています…（${i+1}/${lines.length}）`;
-    // 控えから即答できた行では待たない。実際に国会図書館へ行ったときだけ間を空ける
-    if(i<lines.length-1&&performance.now()-tq>100) await sleep(250);
-  }
+  // 最大2作品だけ並行に調べる。行順を保ち、次の開始を250ms空ける。
+  const t0=performance.now(); let nextLine=0, completed=0;
+  bulkFound=lines.map(({name,range},i)=>({i,name,range,eds:[],edSel:null,err:false,dirty:false}));
+  const worker=async()=>{
+    while(nextLine<lines.length){
+      const i=nextLine++;
+      if(i>0){ try{ await waitRequest(250,job.signal); }catch(e){ return; } }
+      if(seq!==bulkSeq||!job.current()) return;
+      const {name,range}=lines[i]; let eds=[];
+      try{ eds=await searchSeriesAll(name,false,job.signal); }catch(e){}
+      if(seq!==bulkSeq||!job.current()) return;
+      const r={i,name,range,eds,edSel:eds[0]?eds[0].ak+'|'+eds[0].pk:null,err:!!eds.error,dirty:false};
+      bulkFound[i]=r; completed++;
+      const row=document.getElementById('brow'+i); if(row) row.innerHTML=rowHTML(r);
+      counts();
+      const btn=document.getElementById('bcommit'); if(btn) btn.textContent=`調べています…（${completed}/${lines.length}）`;
+    }
+  };
+  await Promise.all([worker(),worker()]);
+  if(seq!==bulkSeq||!job.current()) return;
+  cancel.hidden=true;
   logAct('まとめて調査',`${lines.length}作品`,performance.now()-t0);
   go.disabled=false;
   const btn=document.getElementById('bcommit');
@@ -1983,7 +2418,7 @@ async function runBulkInput(){
    抜け巻検出そのものが嘘になるため、押すたびに引き直す。 */
 let checkSeq=0;
 async function checkNew(force){
-  const seq=++checkSeq;                        // 画面を離れたら走査を降ろすための世代
+  const job=viewJob('new'), seq=++checkSeq;
   const box=document.getElementById('card');
   const all=build(books).filter(g=>g.isSeries);
   const active=all.filter(g=>!isDone(g));      // 完結にした作品は追いかけない
@@ -1996,10 +2431,10 @@ async function checkNew(force){
   }
   /* 24時間以内に調べた作品は飛ばす。これで、429で中断しても次は残りから続けられる。
      「それでも全部」も選べるようにしておく（納得がいかないときの逃げ道） */
-  const recent=g=>{ const m=seriesMeta(g); return !!m&&Date.now()-(m.checkedAt||0)<86400000; };
+  const recent=g=>{ const m=seriesMeta(g); return !!m&&m.parserVersion===QVER&&Date.now()-(m.checkedAt||0)<86400000; };
   /* その題名では国会図書館に1冊も無い（手で入れた本や、正式と違う題名）。
      何度聞いても空振りなので、しばらく飛ばす */
-  const dead=g=>{ const m=seriesMeta(g); return !!m&&m.miss&&Date.now()-(m.checkedAt||0)<30*86400000; };
+  const dead=g=>{ const m=seriesMeta(g); return !!m&&m.parserVersion===QVER&&m.miss&&Date.now()-(m.checkedAt||0)<30*86400000; };
   const gs=force?active.slice():active.filter(g=>!recent(g)&&!dead(g));
   const nRecent=active.filter(g=>recent(g)).length;
   const nDead=active.filter(g=>!recent(g)&&dead(g)).length;
@@ -2019,8 +2454,9 @@ async function checkNew(force){
 
   box.innerHTML=`<div class="lab">新刊を調べています</div>
     <p class="meta" id="cnprog" style="padding:10px 0">${esc(gs[0].series)}（1/${gs.length}）…</p>
-    <div id="cnfound"></div>`;
-  const found=[]; let err=null, ng=0, stopped=false;
+    <button class="ghost2" id="cncancel">調査を中止</button>
+    <div id="cnfound"></div><div id="cneditions"></div>`;
+  const found=[], alternatives=new Map(), seriesLists=new Map(); let err=null, ng=0, stopped=false, succeeded=0, failed=0;
   const t0=performance.now();
   /* 見つかるたびに出す。総時間は変わらないが、待っている間に結果が見え、
      その場で追加もできる。追加した巻は次の描き直しで一覧から消える */
@@ -2030,6 +2466,20 @@ async function checkNew(force){
     if(!fbox) return;
     fbox.innerHTML=live.length?`<div class="lab">続きが出ています</div>`+results(live):'';
     wire(fbox,live,'','none');                 // 新刊はまだ持っていないので既定を「未所持」に
+    const edbox=document.getElementById('cneditions');
+    if(edbox){
+      edbox.innerHTML=[...alternatives.values()].map(g=>`<button class="ghost2" data-alt="${esc(g.key)}">${esc(g.series)}：別の版・出版社の巻を確認</button>`).join('');
+      edbox.querySelectorAll('[data-alt]').forEach(btn=>btn.onclick=()=>{
+        const g=build(books).find(x=>x.key===btn.dataset.alt); if(!g) return;
+        openSeries(g.key); volPicker(g);
+      });
+    }
+  };
+  const cancel=document.getElementById('cncancel');
+  cancel.onclick=()=>{
+    checkSeq++; job.cancel(); cancel.hidden=true;
+    document.getElementById('cnprog').textContent='調査を中止しました。ここまで保存できた結果は残っています。';
+    render(); paint();
   };
   for(let i=0;i<gs.length;i++){
     if(seq!==checkSeq) return;                 // 別の画面へ移った。静かに降りる
@@ -2038,34 +2488,39 @@ async function checkNew(force){
     if(prog) prog.textContent=`${g.series}（${i+1}/${gs.length}）…`;
     let list=[], e0=null;
     // fresh: 新刊の有無だけはキャッシュを信じず、必ず引き直す
-    try{ list=await searchSeries(g.series,akey(g.author)+'|'+pkey(g.edition||''),true); }catch(e){ e0=e; }
+    try{ list=await searchSeries(g.series,akey(g.author)+'|'+pkey(g.edition||''),true,job.signal,seriesLists); }catch(e){ e0=e; }
     if(seq!==checkSeq) return;
-    if(lastError) e0=lastError;
+    if(list.editions&&list.editions.length||e0&&e0.editions) alternatives.set(g.key,g);
+    if(e0&&e0.name==='EditionAmbiguousError'){ err=e0; failed++; paint(); continue; }
     if(e0){
       /* 断られたら間を空けて次へ。3作品続けて失敗したら、そこで切り上げる。
          叩き続けても通らないうえ、迷惑をかける */
-      err=e0; ng++;
+      err=e0; ng++; failed++;
       if(ng>=3){ stopped=true; break; }
-      await sleep(ng*5000);
+      try{ await waitRequest(ng*5000,job.signal); }catch(e){return;}
       continue;
     }
     ng=0;
+    succeeded++;
     const mine=list.filter(x=>x.vol>g.max&&!books.some(b=>b.isbn===x.isbn));
     /* 1作品ごとに記録する。ここで残すから、途中で切れても成果が消えない。
        書誌そのものは持ち越さない（固定化すると最新巻が古いまま嘘になる）。 */
-    meta.series[gkey(g)]={checkedAt:Date.now(),
-      newVols:[...new Set(mine.map(x=>x.vol))].sort((a,b)=>a-b),
-      miss:!list.length};                      // 1冊も出てこない題名は次から飛ばす
-    meta.newAt=Date.now();
-    await saveMeta();
+    const saved=await changeMeta(m=>{
+      if(!job.current()) return null;
+      m.series[gkey(g)]={parserVersion:QVER,checkedAt:Date.now(),newVols:[...new Set(mine.map(x=>x.vol))].sort((a,b)=>a-b),miss:!list.length};
+      m.newAt=Date.now(); return m;
+    });
+    if(seq!==checkSeq) return;
+    if(!saved){ succeeded--; failed++; err=new Error('確認結果を保存できませんでした'); stopped=true; break; }
     if(mine.length){
       mine.forEach(x=>found.push(Object.assign({},x,{_series:g.series,_from:g.max})));
       found.sort((a,b)=>a._series.localeCompare(b._series)||a.vol-b.vol);
       paint();
     }
-    if(i<gs.length-1) await sleep(250);        // 国会図書館に連打しない
+    if(i<gs.length-1){ try{ await waitRequest(250,job.signal); }catch(e){return;} }        // 国会図書館に連打しない
   }
   if(seq!==checkSeq) return;
+  cancel.hidden=true;
   render();
   logAct('新刊確認',`${gs.length}作品｜新刊${found.length}件`+(stopped?'｜中断':''),performance.now()-t0);
   const head=document.querySelector('#card .lab');
@@ -2074,6 +2529,9 @@ async function checkNew(force){
   if(prog) prog.innerHTML=stopped
     ? `<span style="color:var(--alert)">${esc(errText(err))}。</span>
        ここまでの結果は残しました。時間をおいてもう一度押すと、調べていない作品から続けます。`
+    : failed
+      ? `${succeeded}作品の確認が完了し、${failed}作品は確認できませんでした（${esc(errText(err))}）。`
+        +`確認できた新刊は${found.length}件です。失敗した作品はもう一度調べられます。`
     : found.length
       ? `${gs.length}作品を調べました。追加すると「未所持」で入ります。買ったら持ちかたを変えてください。`
       : `${gs.length}作品を調べました。新しい巻は見つかりませんでした。`
@@ -2098,17 +2556,19 @@ function noHits(q){
 
 // 各サービスに実際につないで、どこで止まっているか見せる
 async function diagnose(box){
+  const job=viewJob('diagnose');
   box.innerHTML='<p class="meta" style="padding:10px 0">確かめています…</p>';
   const out=[];
   const probe=async(name,url)=>{
     const t0=Date.now();
     try{
-      const r=await fetch(url);
-      out.push([name, r.ok?`つながった（${Date.now()-t0}ms）`:`HTTP ${r.status}`, r.ok]);
+      await requestData(url,'text',{signal:job.signal});
+      out.push([name, `つながった（${Date.now()-t0}ms）`, true]);
     }catch(e){ out.push([name,'届かない',false]); }
   };
   await probe('国会図書館サーチ',NDL+'?mediatype=books&cnt=1&title='+encodeURIComponent('吾輩は猫である'));
   await probe('openBD','https://api.openbd.jp/v1/get?isbn=9784065123454');
+  if(!job.current()) return false;
   if(typeof Image!=='undefined'){
     const okimg=await new Promise(res=>{
       const i=new Image(); i.onload=()=>res(true); i.onerror=()=>res(false);
@@ -2118,6 +2578,7 @@ async function diagnose(box){
     out.push(['書影（Google）', okimg?'つながった':'届かない', okimg]);
   }
   // 検索の土台は国会図書館サーチ。ここが赤なら他が緑でも本は探せない
+  if(!job.current()) return false;
   const ndlOK=(out[0]||[])[2], alive=out.some(x=>x[2]);
   const note = ndlOK
     ? '検索の土台はつながっています。題名の表記を変えて試してみてください。'
@@ -2131,15 +2592,18 @@ async function diagnose(box){
         <span style="color:${good?'var(--jade)':'var(--alert)'}">${esc(v)}</span></div>`).join('')
     + `</div><p class="meta" style="margin-top:12px">${note}</p>`
     + `<button class="bulk" id="hand2">手で登録する</button>`;
+  return true;
 }
 
 // APIが使えなくても棚は作れるようにする
 async function addManual(title,own){
+  if(store.blocked.has(KEY)){ toast('元の保存データを保護しています。復旧するまで登録できません',true); return null; }
   const t=String(title||'').trim(); if(!t) return null;
   const b=Object.assign({isbn:'M'+Date.now().toString(36),title:t,author:'',publisher:'',
     date:'',cover:'',src:'手入力'},parseSeries(t),
     {added:Date.now(),own:own||'paper',status:'stock',anime:false,rate:0,place:'',note:''});
-  books.unshift(b); await save(); render();
+  if(!await changeBooks(current=>[b,...current])) return null;
+  render();
   return b;
 }
 
@@ -2148,7 +2612,7 @@ function results(items,grouped,q){
   const seen=new Set();
   const one=(x,i)=>{
     const s=coverSrcs(x), p=seriesOf(x);
-    const k=p.vol?skey(p.series)+'#'+p.vol:null;
+    const k=p.vol?mkey(p.series)+'#'+p.vol:null;
     const dup=k&&seen.has(k); if(k) seen.add(k);
     return `<div class="hit">
     ${s.length?`<img src="${esc(s[0])}" alt="" loading="lazy" data-p="1"
@@ -2163,7 +2627,7 @@ function results(items,grouped,q){
      本編の巻の海に埋もれて、あることに気づけない。 */
   const byT=new Map();
   items.forEach((x,i)=>{
-    const p=seriesOf(x), nm=mainTitle(p.series||x.title||''), t=skey(nm);
+    const p=seriesOf(x), nm=mainTitle(p.series||x.title||''), t=mkey(nm);
     if(!byT.has(t)) byT.set(t,{name:nm||x.title, rows:[]});
     byT.get(t).rows.push([x,i]);
   });
@@ -2189,7 +2653,7 @@ function results(items,grouped,q){
 function wire(box,items,q,own){
   const pick=()=>own||addOwn;                  // 呼び出し元が持ちかたを指定できる
   const diag=box.querySelector('#diag');
-  if(diag) diag.onclick=()=>diagnose(box).then(()=>wire(box,[],q));
+  if(diag) diag.onclick=()=>diagnose(box).then(ok=>{if(ok) wire(box,[],q);});
   ['#hand','#hand2'].forEach(sel=>{
     const h=box.querySelector(sel);
     if(h) h.onclick=async()=>{
@@ -2225,13 +2689,8 @@ function wire(box,items,q,own){
     const toSel=(box.querySelector('#bto')||{}).value||'all';
     list=list.filter(x=>!books.some(b=>b.isbn===x.isbn))
       .filter(x=>!x.vol||(x.vol>=from&&(toSel==='all'||x.vol<=+toSel)));
-    let n=0; const got=[];
-    for(const x of list){
-      // 書誌は検索で取れている。ここで引き直さないので待ち時間も要らない
-      const b=await add(x.isbn,{own:pick(),quiet:true,rec:x,defer:true});
-      if(b){ n++; got.push(b); }
-    }
-    await save(); render();
+    const got=await addMany(list,pick()); if(!got) return;
+    const n=got.length;
     fillCoversFor(got);          // 表紙はあとから届けばよい。待たせない
     if(!n){ bulk.textContent='追加できる巻がありませんでした'; bulk.classList.add('done'); return;
     }
@@ -2247,7 +2706,7 @@ function wire(box,items,q,own){
 }
 
 /* ══ スキャン ══ */
-let stream=null, loop=null, busy=false, camGot=[];
+let stream=null, loop=null, busy=false, camGot=[], scanStarting=false, scanSeq=0, scanRequest=null;
 const isSecure=()=>location.protocol==='https:'||['localhost','127.0.0.1'].includes(location.hostname);
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
@@ -2292,7 +2751,9 @@ async function hidAdd(code){
   };
   if(!isISBN13(code)){ row(`ISBN として正しくありません（${code}）`,'ng'); return; }
   if(books.some(b=>b.isbn===code)){ row('もう棚にあります','ng'); return; }
-  const b=await add(code,{own:addOwn,quiet:true});
+  const job=viewJob('usb:'+code);
+  let b=null; try{ b=await add(code,{own:addOwn,quiet:true,signal:job.signal}); }catch(e){}
+  if(!job.current()||!hid.on) return;
   if(b){ hid.n++; row(b.title,'ok'); hid.got.push(b); scanCovers(hid.got); }
   else row(`見つかりませんでした（${code}）`,'ng');
 }
@@ -2318,24 +2779,40 @@ function openScanUSB(){
 }
 
 document.getElementById('scan').onclick=async()=>{
+  if(scanStarting||stream) return;             // 許可待ちの連打で二重にカメラを開かない
   // カメラが使えない端末（Windows の Chrome など）はUSBリーダー用の画面へ回す
   if(!('BarcodeDetector' in window)){ openScanUSB(); return; }
   if(!isSecure()){ toast('カメラは https か localhost でのみ使えます',true); return; }
   const video=document.getElementById('video');
+  const seq=++scanSeq; scanStarting=true;
+  let acquired=null;
   try{
-    stream=await navigator.mediaDevices.getUserMedia({
+    // 読取形式の非対応は、カメラの許可を求める前にUSB／検索の案内へ回す。
+    let det;
+    try{
+      if(typeof BarcodeDetector.getSupportedFormats==='function'&&
+        !(await BarcodeDetector.getSupportedFormats()).includes('ean_13')) throw new Error('unsupported');
+      if(seq!==scanSeq) return;
+      det=new BarcodeDetector({formats:['ean_13']});
+    }catch(e){
+      if(seq===scanSeq){ openScanUSB(); toast('この端末はカメラ読取に対応していません。USBリーダーか「探す」を使ってください',true); }
+      return;
+    }
+    acquired=await navigator.mediaDevices.getUserMedia({
       video:{facingMode:{ideal:'environment'},width:{ideal:1280}},audio:false});
-  }catch(e){ toast('カメラを使う許可が必要です',true); return; }
-  video.srcObject=stream; await video.play();
-  document.getElementById('scanner').classList.add('on');
-  document.getElementById('log').innerHTML=''; camGot=[];
-  try{ history.pushState({sc:1},''); }catch(e){}   // 戻るキーで閉じられるようにする
+    // 許可待ちの間に閉じられた場合、遅れて届いたストリームも必ず停止する。
+    if(seq!==scanSeq){ acquired.getTracks().forEach(t=>t.stop()); return; }
+    stream=acquired; scanRequest=new AbortController(); video.srcObject=stream; await video.play();
+    if(seq!==scanSeq) return;                 // stopScan が停止済み
+    document.getElementById('scanner').classList.add('on');
+    document.getElementById('log').innerHTML=''; camGot=[];
+    try{ history.pushState({sc:1},''); }catch(e){}   // 戻るキーで閉じられるようにする
 
-  const det=new BarcodeDetector({formats:['ean_13']});
-  loop=setInterval(async()=>{
+    loop=setInterval(async()=>{
     if(busy) return; busy=true;
     try{
       const [code]=await det.detect(video);
+      if(seq!==scanSeq) return;
       if(code){
         const v=code.rawValue.replace(/\D/g,'');
         if(isISBN13(v)){
@@ -2345,7 +2822,8 @@ document.getElementById('scan').onclick=async()=>{
           if(books.some(x=>x.isbn===v)){
             pushLog('すでに棚にあります');
           }else{
-            const b=await add(v,{own:'paper',quiet:true});
+            const b=await add(v,{own:'paper',quiet:true,signal:scanRequest.signal});
+            if(seq!==scanSeq) return;
             if(b){ pushLog(b.series?`${b.series} ${b.vol}`:b.title); camGot.push(b); }
             else  pushLog('情報が見つかりません（'+v+'）');
           }
@@ -2355,8 +2833,16 @@ document.getElementById('scan').onclick=async()=>{
         }
       }
     }catch(e){}
-    busy=false;
-  },260);
+      finally{ if(seq===scanSeq) busy=false; }
+    },260);
+  }catch(e){
+    if(seq===scanSeq){
+      stopScan();
+      toast(e.name==='NotAllowedError'
+        ?'カメラの利用が許可されませんでした。「探す」やUSBリーダーでも登録できます'
+        :'カメラを開始できませんでした。「探す」やUSBリーダーでも登録できます',true);
+    }else if(acquired){ acquired.getTracks().forEach(t=>t.stop()); }
+  }finally{ if(seq===scanSeq) scanStarting=false; }
 };
 function pushLog(t){
   const box=document.getElementById('log');
@@ -2365,8 +2851,12 @@ function pushLog(t){
 }
 // カメラは必ず止める。止め忘れるとレンズが光ったままになり、電池も食う
 function stopScan(fromPop){
+  scanSeq++; scanStarting=false; busy=false;
+  if(scanRequest) scanRequest.abort(); scanRequest=null;
   clearInterval(loop); loop=null;
   if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
+  const video=document.getElementById('video');
+  video.pause(); video.srcObject=null;
   // 読んだぶんの表紙は、閉じたところでまとめて1回聞く
   if(camGot.length) fillCoversFor(camGot.splice(0));
   document.getElementById('scanner').classList.remove('on');
@@ -2379,29 +2869,32 @@ document.getElementById('stop').onclick=()=>stopScan();
    表紙URLの無い本は、描画のたびに Amazon の当てずっぽうに頼っている。
    openBD は ISBN のカンマ区切りで一括照会できるので、1〜2回の通信で
    棚全体ぶんの表紙URLを埋められる。勝手には走らせない（メニューから手動）。 */
-async function coverLookup(targets){
+async function coverLookup(targets,signal){
   let n=0;
   for(let i=0;i<targets.length;i+=500){          // URLが長くなりすぎない単位で刻む
     const part=targets.slice(i,i+500);
-    const r=await fetch('https://api.openbd.jp/v1/get?isbn='+part.map(b=>b.isbn).join(','));
-    if(!r.ok) throw new Error('HTTP '+r.status);
-    (await r.json()).forEach((d,j)=>{
+    const data=await requestData('https://api.openbd.jp/v1/get?isbn='+part.map(b=>b.isbn).join(','),'json',{signal});
+    if(!Array.isArray(data)) throw new Error('表紙の応答が不正です');
+    data.forEach((d,j)=>{
       const c=d&&d.summary&&d.summary.cover;
-      if(c){ part[j].cover=c; n++; }
+      if(c&&part[j]){ part[j].cover=c; n++; }
     });
   }
   return n;
 }
 async function fillCovers(){
-  const targets=books.filter(b=>isISBN13(b.isbn)&&!b.cover);
+  const job=viewJob('covers');
+  const targets=books.filter(b=>isISBN13(b.isbn)&&!b.cover).map(b=>Object.assign({},b));
   if(!targets.length){ toast('表紙URLの無い本はありません'); return; }
   toast(`${targets.length}冊の表紙を探しています…`);
   const t0=performance.now();
   let n=0;
-  try{ n=await coverLookup(targets); }
-  catch(e){ toast('openBD に届きませんでした',true); return; }
+  try{ n=await coverLookup(targets,job.signal); }
+  catch(e){ if(job.current()) toast(errText(e),true); return; }
+  if(!job.current()) return;
+  if(n&&!await commitCovers(targets)) return;
   logAct('表紙補完',`${targets.length}冊中${n}冊`,performance.now()-t0);
-  if(n){ await save(); render(); closeSheet(); }
+  if(n){ render(); closeSheet(); }
   toast(n?`${n}冊の表紙が見つかりました`:'openBD にも表紙がありませんでした',!n);
 }
 /* まとめて追加した直後の本は表紙URLを持っていない（国会図書館は書影を返さない）。
@@ -2409,9 +2902,15 @@ async function fillCovers(){
    描画が起こす表紙取得と同じ種類の通信なので、追加操作の続きとして自動で走らせてよい。
    失敗しても黙って引き下がる——従来のフォールバック（Amazon→Google）がそのまま働く */
 async function fillCoversFor(list){
-  const targets=list.filter(b=>isISBN13(b.isbn)&&!b.cover);
+  const targets=list.filter(b=>isISBN13(b.isbn)&&!b.cover).map(b=>Object.assign({},b));
   if(!targets.length) return;
-  try{ if(await coverLookup(targets)){ await save(); render(); } }catch(e){}
+  try{ if(await coverLookup(targets)&&await commitCovers(targets)) render(); }catch(e){}
+}
+
+async function commitCovers(targets){
+  const covers=new Map(targets.filter(b=>b.cover).map(b=>[b.isbn,b.cover]));
+  // 応答待ち中に削除した本や、利用者が設定した表紙を古い結果で戻さない。
+  return changeBooks(current=>current.map(b=>!b.cover&&covers.has(b.isbn)?Object.assign({},b,{cover:covers.get(b.isbn)}):b));
 }
 
 /* ══ メニュー ══ */
@@ -2444,8 +2943,9 @@ document.getElementById('more').onclick=()=>{
       <button id="ejson">JSON で書き出す</button>
       <button id="ecsv">CSV で書き出す</button>
       <button id="imp">JSON を読み込む</button>
+      <button id="devicesync">PC・スマホのデータを合わせる</button>
       <button id="oplog">操作の記録</button>
-      <button id="net">通信を確かめる</button>
+      <button id="net">通信を確かめる</button>${store.blocked.size?'<button id="recoverydl">復旧用の控えを書き出す</button>':''}
     </div>
     <div class="lab">この棚のこと</div>
     <div class="rows">
@@ -2460,6 +2960,8 @@ document.getElementById('more').onclick=()=>{
       <div class="r"><span>アニメで見た</span><span>${n(b=>b.anime)}</span></div>
       ${top.map(([a,c])=>`<div class="r"><span>${esc(a)}</span><span>${c}冊</span></div>`).join('')}
     </div>`);
+  const recoverydl=document.getElementById('recoverydl'); if(recoverydl) recoverydl.onclick=exportRecovery;
+  document.getElementById('devicesync').onclick=openDeviceSync;
   document.getElementById('tidy').onclick=()=>openTidy();
   document.getElementById('oplog').onclick=()=>openLog();
   document.getElementById('binput').onclick=()=>openBulkInput();
@@ -2468,7 +2970,7 @@ document.getElementById('more').onclick=()=>{
   document.getElementById('covfill').onclick=()=>fillCovers();
   document.getElementById('net').onclick=()=>{
     const box=document.getElementById('card');
-    diagnose(box).then(()=>wire(box,[],''));
+    diagnose(box).then(ok=>{if(ok) wire(box,[],'');});
   };
   document.getElementById('ejson').onclick=()=>exportJSON();
   document.getElementById('ecsv').onclick=()=>{
@@ -2485,16 +2987,35 @@ document.getElementById('more').onclick=()=>{
         // 旧形式（配列そのまま）と新形式（{books,done,sort}）の両方を受ける
         const list=Array.isArray(data)?data:(data&&Array.isArray(data.books)?data.books:null);
         if(!list) throw 0;
-        if(!Array.isArray(data)){
-          (Array.isArray(data.done)?data.done:[]).forEach(k=>doneKeys.add(k));
-          if(data.sort&&SORTS.some(x=>x.id===data.sort)) sortBy=data.sort;
-        }
-        const seen=new Set(books.map(b=>b.isbn));
-        list.forEach(b=>{ if(b&&b.isbn&&!seen.has(b.isbn)){ books.push(normalize(b)); seen.add(b.isbn); } });
-        books=books.filter(b=>b.title);            // 題名まで無いものは棚に置けない
-        books.sort((x,y)=>(y.added||0)-(x.added||0));
-        await save(); await saveMeta(); render(); closeSheet(); toast('読み込みました');
-        logAct('読み込み',`${list.length}件のファイル`);
+        const incoming=list.map(normalize);
+        if(store.blocked.has(KEY)||store.blocked.has(META)) throw new Error('保存データの復旧が必要です');
+        const seen=new Set(books.map(b=>b.isbn)), unique=[], repeated=[], held=[];
+        incoming.forEach(b=>{
+          if(seen.has(b.isbn)){ repeated.push(b); return; }
+          if(classificationIssue(b)){ held.push({title:b.title,reason:'短編集・Exの題名と登録シリーズ・巻が一致しません。確認してから読み込んでください'}); return; }
+          const overlap=!isISBN13(b.isbn)&&b.series&&b.vol&&books.concat(unique).some(x=>
+            mkey(x.series||'')===mkey(b.series)&&x.vol===b.vol&&(!b.author||!x.author||akey(x.author)===akey(b.author)));
+          if(overlap){ held.push({title:b.title,reason:'同じ巻が棚にあります。ISBN・版を確認してください'}); return; }
+          unique.push(b); seen.add(b.isbn);
+        });
+        const pending=held.concat(!Array.isArray(data)&&Array.isArray(data.pending)?data.pending:[]);
+        openWith(`<h2>読み込む前に確認</h2>
+          <p class="meta">新しく入る${unique.length}冊／同じISBN${repeated.length}件は追加しません。
+          既存の本のメモ・読書状態は上書きしません。${pending.length?`未確定・要確認の${pending.length}件は保留します。`:''}</p>
+          <div class="rows">${unique.slice(0,80).map(b=>`<div class="r"><span>${esc(b.title)}</span><span>${esc(b.author)} ${b.vol?b.vol+'巻':''}</span></div>`).join('')}
+          ${unique.length>80?`<p class="meta">ほか${unique.length-80}冊</p>`:''}</div>
+          ${pending.length?`<details><summary>保留する候補</summary><p class="meta">${pending.slice(0,80).map(b=>esc(String(b&&b.title||'書名未確定'))+(b&&b.reason?'：'+esc(b.reason):'')).join('<br>')}</p></details>`:''}
+          <p class="meta">読み込む前に元の棚をJSONで書き出してください。未確定の候補は追加しません。</p>
+          <div class="acts"><button id="importbackup" class="ghost2">元の棚をJSONで書き出す</button>
+          <button id="importcommit" class="save">確認した内容を読み込む</button></div>`);
+        document.getElementById('importbackup').onclick=exportJSON;
+        document.getElementById('importcommit').onclick=async e=>{
+          const btn=e.currentTarget; btn.disabled=true;
+          const result=await importState(unique,data);
+          if(!result){ btn.disabled=false; toast('読み込みを保存できませんでした。元の棚は変えていません。控えと保存領域を確認してください',true); return; }
+          render(); closeSheet(); toast(`${result.added}冊を読み込みました（重複・未確定は追加していません）`);
+          logAct('読み込み',`${unique.length}冊｜重複${repeated.length}件｜保留${pending.length}件`);
+        };
       }catch(e){ toast('このファイルは読み込めません',true); }
     };
     inp.click();
@@ -2558,10 +3079,20 @@ function openLog(){
       <button id="logclear">記録を消す</button></div>`);
   document.getElementById('logdl').onclick=()=>dl(JSON.stringify(oplog,null,1),'json','application/json');
   document.getElementById('logclear').onclick=async()=>{
-    oplog=[]; await store.set(LOG,[]); closeSheet(); toast('記録を消しました');
+    clearTimeout(logT);
+    if(!await store.set(LOG,[])) return;
+    oplog=[]; closeSheet(); toast('記録を消しました');
   };
 }
 
+async function exportRecovery(){
+  const keys=[KEY,META,PENDING,...PREV], raw={};
+  try{
+    for(const k of keys.flatMap(k=>[k,k+':broken'])) raw[k]=window.storage?(await window.storage.get(k))?.value??null:localStorage.getItem(k);
+    dl(JSON.stringify({app:'bookshelf-recovery',version:1,raw},null,2),'recovery.json','application/json');
+    toast('復旧用の原データを書き出しました。通常の読み込みには使わず、控えとして保管してください');
+  }catch(e){ toast('復旧用の控えを読み出せませんでした。ブラウザのデータは消さないでください',true); }
+}
 function dl(text,ext,mime){
   const url=URL.createObjectURL(new Blob([text],{type:mime}));
   const a=document.createElement('a');
@@ -2571,15 +3102,246 @@ function dl(text,ext,mime){
   setTimeout(()=>URL.revokeObjectURL(url),10000);
 }
 // 棚の控えを取ったときだけ「最後に書き出した日」を進める（操作記録の書き出しでは進めない）
-function markExported(ext){
-  meta.exportAt=Date.now(); meta.exportN=books.length; saveMeta();
+async function markExported(ext){
+  const ok=await changeMeta(m=>{ m.exportAt=Date.now(); m.exportN=books.length; return m; });
+  if(!ok) toast('書き出しましたが、最後に控えを取った日時は保存できませんでした',true);
   logAct('書き出し',ext);
   render();
 }
 /* 棚だけでなく、完結の印と並び順も一緒に書き出す。
    books だけ戻すと完結の印が消えていた */
-const exportJSON=()=>{ dl(JSON.stringify({app:'bookshelf',version:3,
-  books,done:[...doneKeys],sort:sortBy},null,2),'json','application/json'); markExported('json'); };
+const shelfBackup=()=>({app:'bookshelf',version:3,books,done:[...doneKeys],sort:sortBy,dir:sortDir});
+const exportJSON=()=>{ dl(JSON.stringify(shelfBackup(),null,2),'json','application/json'); markExported('json'); };
+
+/* ══ 端末間のファイル同期 ══
+   サーバーへの自動同期ではない。旧版のJSONとも差分を比較できる。
+   時計やファイルの新旧で勝者を決めず、異なる値は利用者が選ぶ。
+   不在は削除の証拠にならないので、片側だけの本は既定で残す。 */
+const SYNC_BACKUP='bookshelf:before-sync';
+const SYNC_FIELDS=[
+  {label:'書名・巻・版',keys:['title','series','vol','author','publisher','date','volumeAmbiguous']},
+  {label:'持ちかた',keys:['own']}, {label:'読みかた・読了日',keys:['status','readAt']},
+  {label:'アニメ',keys:['anime']}, {label:'評価',keys:['rate']},
+  {label:'メモ',keys:['note']}, {label:'場所',keys:['place']}, {label:'表紙',keys:['cover']}
+];
+const syncStable=v=>JSON.stringify(v,(_k,x)=>x&&typeof x==='object'&&!Array.isArray(x)
+  ?Object.fromEntries(Object.keys(x).sort().map(k=>[k,x[k]])):x);
+const syncSignature=()=>syncStable({books,done:[...doneKeys].sort()});
+const syncValues=(b,f)=>f.keys.map(k=>b[k]??null);
+const syncStorage=async()=>Promise.all([KEY,META].map(async k=>window.storage
+  ?(await window.storage.get(k))?.value??null:localStorage.getItem(k)));
+function syncStoredSignature(raw){
+  const saved=raw[0]==null?[]:JSON.parse(raw[0]), settings=raw[1]==null?{}:JSON.parse(raw[1]);
+  if(!Array.isArray(saved)) throw new Error('保存データの復旧が必要です');
+  validateMeta(settings);
+  return syncStable({books:saved.map(normalize),done:(settings.done||[]).slice().sort()});
+}
+function planShelfSync(data){
+  if(!data||(!Array.isArray(data)&&(typeof data!=='object'||data.app&&data.app!=='bookshelf'
+    ||data.version!=null&&(!Number.isInteger(data.version)||data.version<1||data.version>3))))
+    throw new Error('本棚の対応するJSONファイルを選んでください');
+  const list=Array.isArray(data)?data:data.books;
+  if(!Array.isArray(list)) throw new Error('本の一覧がありません');
+  const incoming=list.map(normalize), local=books.map(normalize);
+  const index=items=>{
+    const m=new Map();
+    for(const b of items){
+      if(m.has(b.isbn)) throw new Error('同じISBN・登録IDが複数あります。重複を確認してからやり直してください');
+      m.set(b.isbn,b);
+    }
+    return m;
+  };
+  const a=index(local), b=index(incoming);
+  const plan={signature:syncSignature(),local,added:[],changed:[],onlyLocal:[],done:[],held:[],same:0};
+  for(const remote of incoming){
+    const own=a.get(remote.isbn);
+    if(classificationIssue(remote)){
+      plan.held.push({title:remote.title,reason:'題名とシリーズ・巻の分類を確認してください'}); continue;
+    }
+    if(!own){
+      // ISBN不明の同一巻は自動で同じ本とも別の本とも決めない。
+      if(remote.series&&remote.vol&&local.concat(incoming.filter(x=>x!==remote)).some(x=>
+        (!isISBN13(remote.isbn)||!isISBN13(x.isbn))&&mkey(x.series||'')===mkey(remote.series)&&x.vol===remote.vol
+        &&(!remote.author||!x.author||akey(x.author)===akey(remote.author)))){
+        plan.held.push({title:remote.title,reason:'同じ巻の候補があります。ISBN・版・複本を確認してください'}); continue;
+      }
+      plan.added.push(remote); continue;
+    }
+    const changes=SYNC_FIELDS.map((f,i)=>({field:i,local:syncValues(own,f),remote:syncValues(remote,f)}))
+      .filter(x=>syncStable(x.local)!==syncStable(x.remote));
+    if(changes.length) plan.changed.push({isbn:remote.isbn,title:own.title,remote,changes});
+    else plan.same++;
+  }
+  plan.onlyLocal=local.filter(x=>!b.has(x.isbn));
+  if(!Array.isArray(data)&&Object.hasOwn(data,'done')){
+    if(!Array.isArray(data.done)||data.done.some(k=>typeof k!=='string')) throw new Error('完結の印が不正です');
+    const remoteDone=new Set(data.done);
+    for(const key of new Set([...doneKeys,...remoteDone])){
+      if(doneKeys.has(key)!==remoteDone.has(key)) plan.done.push({key,local:doneKeys.has(key),remote:remoteDone.has(key)});
+    }
+  }
+  return plan;
+}
+async function applyShelfSync(plan,choices){
+  return stateJob(async()=>{
+    if(store.blocked.has(KEY)||store.blocked.has(META)||store.blocked.has(PENDING))
+      throw new Error('元の保存データを保護しています。復旧してから反映してください');
+    if(plan.signature!==syncSignature()||!plan.storage||plan.signature!==syncStoredSignature(plan.storage)
+      ||syncStable(await syncStorage())!==syncStable(plan.storage))
+      throw new Error('確認中に棚が変わりました。再読み込みして、ファイルを選び直してください');
+    const next=plan.local.map(b=>({...b})), done=new Set(doneKeys);
+    let updated=0, removed=0, added=0;
+    for(let i=0;i<plan.changed.length;i++){
+      const row=plan.changed[i], target=next.find(b=>b.isbn===row.isbn); let changed=false;
+      for(const item of row.changes){
+        const value=choices.fields[`${i}:${item.field}`];
+        if(value!=='local'&&value!=='remote') throw new Error('違う値がある項目の選択を完了してください');
+        if(value==='remote'){
+          for(const k of SYNC_FIELDS[item.field].keys){
+            if(Object.hasOwn(row.remote,k)) target[k]=row.remote[k]; else delete target[k];
+          }
+          changed=true;
+        }
+      }
+      if(changed) updated++;
+    }
+    for(let i=0;i<plan.done.length;i++){
+      const row=plan.done[i], value=choices.done[i];
+      if(value!=='local'&&value!=='remote') throw new Error('完結の印の選択を完了してください');
+      if(row[value]) done.add(row.key); else done.delete(row.key);
+    }
+    for(let i=0;i<plan.added.length;i++) if(choices.add.includes(i)){ next.push(plan.added[i]); added++; }
+    for(let i=0;i<plan.onlyLocal.length;i++) if(choices.remove.includes(i)){
+      const at=next.findIndex(b=>b.isbn===plan.onlyLocal[i].isbn);
+      if(at>=0){ next.splice(at,1); removed++; }
+    }
+    const nextMeta={...metaSnapshot(),done:[...done]};
+    // 同じファイルを再度確認しただけなら、前回の復旧用控えもそのまま残す。
+    if(!added&&!updated&&!removed&&syncStable([...done].sort())===syncStable([...doneKeys].sort()))
+      return {added,updated,removed};
+    // 復旧用JSONを端末に保存できなければ、本棚の変更には進まない。
+    if(await store.set(SYNC_BACKUP,{...shelfBackup(),savedAt:new Date().toISOString()})===false) return false;
+    if(!await writeShelfState(next,nextMeta)) return false;
+    return {added,updated,removed};
+  });
+}
+function openDeviceSync(){
+  openWith(`<h2>PC・スマホのデータを合わせる</h2>
+    <p class="meta">現在はファイルを渡す手動同期です。クラウドへの自動同期は未設定です。</p>
+    <ol class="meta"><li>両方の端末で先に「JSONで書き出す」で控えを保存します。</li>
+    <li>片方のJSONをもう片方の端末へ渡し、「受け取ったJSONと比較する」を押します。</li>
+    <li>違うメモ・読書状況を確認して反映します。反映後のJSONを元の端末にも戻してください。</li></ol>
+    <p class="meta">同じURLを開くだけでは棚は同期されません。メモもファイルに含まれます。共有先は自分で選んでください。</p>
+    <div class="menu"><button id="syncdownload">JSONで書き出す</button>
+    <button id="syncshare">JSONを共有する</button><button id="syncread">受け取ったJSONと比較する</button>
+    <button id="syncprevious">直前の反映前の控えを保存する</button></div>
+    <p class="meta" id="syncmessage" role="status"></p>`);
+  document.getElementById('syncdownload').onclick=exportJSON;
+  document.getElementById('syncshare').onclick=shareShelf;
+  document.getElementById('syncprevious').onclick=async()=>{
+    const data=await store.get(SYNC_BACKUP);
+    if(!data||data.app!=='bookshelf'||!Array.isArray(data.books)){ toast('この端末には反映前の控えがありません',true); return; }
+    dl(JSON.stringify(data,null,2),'json','application/json');
+  };
+  document.getElementById('syncread').onclick=()=>{
+    const view=bulkSeq;
+    const input=document.createElement('input'); input.type='file'; input.accept='.json,application/json';
+    input.onchange=async()=>{
+      if(!input.files.length) return;
+      try{
+        if(input.files[0].size>20*1024*1024) throw new Error('ファイルが大きすぎます（上限20MB）');
+        const data=JSON.parse(await input.files[0].text());
+        await stateQueue;
+        const plan=planShelfSync(data); plan.storage=await syncStorage();
+        if(!sheetOpen||view!==bulkSeq) return;
+        if(plan.signature!==syncStoredSignature(plan.storage))
+          throw new Error('別の画面で棚が変わっています。再読み込みしてから比較してください');
+        showShelfSync(plan);
+      }catch(e){ const el=document.getElementById('syncmessage');
+        if(el) el.textContent=e.message||'このファイルは読み込めません'; }
+    };
+    input.click();
+  };
+}
+async function shareShelf(){
+  const el=document.getElementById('syncmessage');
+  const text=JSON.stringify(shelfBackup(),null,2);
+  const file=new File([text],`bookshelf-${new Date().toISOString().slice(0,10)}.json`,{type:'application/json'});
+  try{
+    if(!navigator.share||!navigator.canShare||!navigator.canShare({files:[file]})){
+      dl(text,'json','application/json');
+      if(el) el.textContent='このブラウザではJSONを直接共有できないため、保存画面を開きました。保存したファイルを渡してください。';
+      return;
+    }
+    await navigator.share({files:[file],title:'本棚の控え'});
+    // shareの完了は受信先の保存・反映完了ではない（Windowsでは画面を開いた時点）。
+    if(el) el.textContent='共有操作を終えました。受け取った端末でファイルの比較・反映を行ってください。';
+  }catch(e){ if(el) el.textContent=e.name==='AbortError'?'共有を中止しました。棚は変わっていません。'
+    :'共有できませんでした。「JSONで書き出す」で保存して渡してください。'; }
+}
+function showShelfSync(plan){
+  const choices={fields:{},done:{},add:plan.added.map((_,i)=>i),remove:[]};
+  const labels={paper:'紙',digital:'電子',none:'未所持',stock:'未読',now:'読書中',read:'読了',stop:'中断'};
+  const display=(values,field)=>values.map((v,i)=>field===2&&i===1?(v?ymd(v):'読了日なし')
+    :v==null||v===''?'（空）':v===true?'あり':v===false?'なし':labels[v]||String(v)).join(' / ');
+  const select=(id,a,b)=>`<select class="sync-choice" data-choice="${id}" aria-label="採用する値">
+    <option value="">選んでください</option><option value="local">この端末を残す</option><option value="remote">受け取った値を使う</option></select>
+    <div class="sync-values"><p>この端末：${esc(a)}</p><p>受け取った値：${esc(b)}</p></div>`;
+  openWith(`<h2>違いを確認して反映</h2>
+    <p class="meta">新規${plan.added.length}冊／内容が違う${plan.changed.length}冊／同じ${plan.same}冊／保留${plan.held.length}冊。
+    並び順と新刊の確認記録はこの端末の設定を残します。</p>
+    ${plan.changed.map((r,i)=>`<details class="sync-book" open><summary>${esc(r.title)} <small>${esc(r.isbn)}</small></summary>
+      ${r.changes.map(c=>`<div class="sync-field"><strong>${esc(SYNC_FIELDS[c.field].label)}</strong>
+        ${select(`${i}:${c.field}`,display(c.local,c.field),display(c.remote,c.field))}</div>`).join('')}</details>`).join('')}
+    ${plan.done.length?`<details class="sync-book" open><summary>完結の印</summary>${plan.done.map((r,i)=>
+      `<div class="sync-field"><strong>${esc(r.key)}</strong>${select(`done:${i}`,r.local?'完結':'未完結',r.remote?'完結':'未完結')}</div>`).join('')}</details>`:''}
+    ${plan.added.length?`<details class="sync-book" open><summary>受け取ったファイルにだけある本</summary>${plan.added.map((b,i)=>
+      `<label class="sync-check"><input type="checkbox" data-add="${i}" checked>追加する：${esc(b.title)} <small>${esc(b.isbn)}</small></label>`).join('')}</details>`:''}
+    ${plan.onlyLocal.length?`<details class="sync-book"><summary>この端末にだけある${plan.onlyLocal.length}冊（既定では残します）</summary>
+      <p class="meta">別端末で削除した本か、この端末で新しく追加した本かは区別できません。消す本だけ選んでください。</p>
+      ${plan.onlyLocal.map((b,i)=>`<label class="sync-check"><input type="checkbox" data-remove="${i}">棚から出す：${esc(b.title)} <small>${esc(b.isbn)}</small></label>`).join('')}</details>`:''}
+    ${plan.held.length?`<details class="sync-book"><summary>保留する本</summary>${plan.held.map(b=>`<p class="meta">${esc(b.title)}：${esc(b.reason)}</p>`).join('')}</details>`:''}
+    <p class="meta">反映直前の控えは、この端末に自動保存します。取り消したいときは同期メニューから控えを保存して、もう一度比較してください。</p>
+    <p id="syncresult" class="meta" role="status"></p>
+    <div class="acts"><button id="synckeep" class="ghost2">未選択はこの端末を残す</button>
+    <button id="syncapply" class="save" disabled>選んだ内容を反映する</button></div>`);
+  const card=document.getElementById('card'), btn=document.getElementById('syncapply');
+  const update=()=>{
+    card.querySelectorAll('[data-choice]').forEach(el=>{
+      const key=el.dataset.choice;
+      if(key.startsWith('done:')) choices.done[key.slice(5)]=el.value; else choices.fields[key]=el.value;
+    });
+    choices.add=[...card.querySelectorAll('[data-add]:checked')].map(el=>Number(el.dataset.add));
+    choices.remove=[...card.querySelectorAll('[data-remove]:checked')].map(el=>Number(el.dataset.remove));
+    btn.disabled=[...card.querySelectorAll('[data-choice]')].some(el=>!el.value);
+    document.getElementById('syncresult').textContent=`追加${choices.add.length}冊／棚から出す${choices.remove.length}冊。違う値は項目ごとに選んでください。`;
+  };
+  card.querySelectorAll('select,input[type=checkbox]').forEach(el=>el.onchange=update);
+  document.getElementById('synckeep').onclick=()=>{
+    card.querySelectorAll('[data-choice]').forEach(el=>{if(!el.value) el.value='local';}); update();
+  };
+  btn.onclick=async()=>{
+    const view=bulkSeq;
+    btn.disabled=true;
+    try{
+      const result=await applyShelfSync(plan,choices);
+      if(!result) throw new Error('保存できませんでした。反映は完了していません。保存領域を確認してやり直してください');
+      render();
+      logAct('端末間の反映',`追加${result.added}／更新${result.updated}／削除${result.removed}`);
+      if(!sheetOpen||view!==bulkSeq){ toast('端末間の反映を保存しました'); return; }
+      openWith(`<h2>この端末に反映しました</h2><p class="meta">追加${result.added}冊／更新${result.updated}冊／棚から出した${result.removed}冊。</p>
+        <p class="meta">もう一方の端末も合わせるには、この結果のJSONを渡し、同じ比較・反映を行ってください。自動送信はしていません。</p>
+        <div class="menu"><button id="syncfinishdownload">結果のJSONを保存する</button><button id="syncfinishshare">結果のJSONを共有する</button></div>
+        <p class="meta" id="syncmessage" role="status"></p>`);
+      document.getElementById('syncfinishdownload').onclick=exportJSON;
+      document.getElementById('syncfinishshare').onclick=shareShelf;
+    }catch(e){
+      if(sheetOpen&&view===bulkSeq){ document.getElementById('syncresult').textContent=e.message; btn.disabled=false; }
+      else toast(e.message,true);
+    }
+  };
+  update();
+}
 /* ══ 書き出しの催促 ══
    棚は端末の中にしか無い。ブラウザのデータを消せば全部消える。
    書き出し機能があっても、きっかけが無いと押さないので、
@@ -2616,7 +3378,24 @@ function exportHint(){
 function normalize(b){
   // 題名の無いレコードが混ざると、表紙や一覧の描画がそこで落ちる。
   // 読み込んだファイルが手で編集されていることもあるので、ここで最低限を保証する
-  b.title=String(b.title==null?'':b.title);
+  if(!b||typeof b!=='object'||Array.isArray(b)) throw new Error('本の形式が不正です');
+  b=Object.assign({},b);                // 入力を直接変更しない（読み込みの事前検証）
+  if(!['string','number'].includes(typeof b.isbn)) throw new Error('ISBNがありません');
+  b.isbn=String(b.isbn).trim();
+  if(!b.isbn||typeof b.title!=='string'||!b.title.trim()) throw new Error('ISBNまたは題名がありません');
+  // 手入力の M... は保持。ハイフン付きISBNとISBN-10は同じISBN-13へ寄せる。
+  const code=norm(b.isbn).replace(/[\s-]/g,'');
+  const converted=isbn13from10(code);
+  if(converted) b.isbn=converted;
+  else if(isISBN13(code)) b.isbn=code;
+  if(b.series!=null&&typeof b.series!=='string') throw new Error('シリーズ名が不正です');
+  if(b.vol!=null&&b.vol!==''){
+    if(!['number','string'].includes(typeof b.vol)) throw new Error('巻数が不正です');
+    const v=Number(b.vol);
+    if(!Number.isInteger(v)||v<1||v>200) throw new Error('巻数が不正です');
+    b.vol=v;
+  }else b.vol=null;
+  b.title=String(b.title);
   b.author=String(b.author==null?'':b.author);
   b.publisher=String(b.publisher==null?'':b.publisher);
   b.date=String(b.date==null?'':b.date);
@@ -2627,7 +3406,7 @@ function normalize(b){
   delete b.read;
   if(!b.own) b.own='paper';            // 以前のデータは「紙で所持」とみなす
   b.anime=!!b.anime; b.rate=b.rate||0; b.readAt=b.readAt||0;
-  b.place=b.place||''; b.note=b.note||''; b.cover=b.cover||'';
+  b.place=String(b.place||''); b.note=String(b.note||''); b.cover=String(b.cover||'');
   return b;
 }
 /* 打鍵ごとに棚全体を描き直さない。手が少し止まってから1回だけ描く。
@@ -2638,7 +3417,7 @@ document.getElementById('q').addEventListener('input',e=>{
   qT=setTimeout(()=>{
     const v=norm(e.target.value).trim().toLowerCase();
     if(v===filter) return;
-    filter=v; render();
+    filter=v; shelfLimit=60; render();
   },150);
 });
 let tt;
@@ -2659,27 +3438,37 @@ function toast(msg,warn,action){
 }
 (async()=>{
   // 3つの読み込みは互いに独立なので、直列に待たず一度に引く
-  const [b0,m0,l0]=await Promise.all([store.get(KEY),store.get(META),store.get(LOG)]);
-  books=b0||[];
+  const recovery=await recoverPending();
+  const loadedState=await Promise.all([store.get(KEY),store.get(META),store.get(LOG)]);
+  const [b0,m0,l0]=recovery&&!recovery.restored?[recovery.before.books,recovery.before.meta,loadedState[2]]:loadedState;
+  let loaded=b0, sourceKey=KEY;
   let fromPrev=false;
-  if(!books.length){
+  // v3 が「無い」ときだけ移行する。保存済み [] は利用者が空にした棚。
+  if(!recovery&&store.missing.has(KEY)){
     for(const k of PREV){
       const old=await store.get(k);
-      if(Array.isArray(old)&&old.length){ books=old; fromPrev=true; break; }
+      if(Array.isArray(old)&&old.length){ loaded=old; sourceKey=k; fromPrev=true; break; }
     }
   }
-  // normalize は同じオブジェクトを直接直すので、比較用の控えは先に取る
-  const before=fromPrev?'':JSON.stringify(books);
-  books=books.map(normalize).filter(b=>b.title);
-  loadMeta(m0);
+  // 移行・型補正の有無を比較するため、入力の控えは先に取る
+  const before=fromPrev?'':JSON.stringify(loaded);
+  try{
+    if(loaded==null&&store.missing.has(KEY)) loaded=[];
+    if(!Array.isArray(loaded)) throw new Error('棚の形式が不正です');
+    books=loaded.map(normalize);
+  }catch(e){ books=[]; await store.quarantine(sourceKey); store.blocked.add(KEY); }
+  try{ loadMeta(m0); }catch(e){ await store.quarantine(META); loadMeta(null); }
   oplog=Array.isArray(l0)?l0:[];
   /* 読み込みに失敗したときは保存しない。空の棚で上書きすると、
      壊れていた（＝直せたかもしれない）データまで消えてしまう */
-  if(store.bad) toast('保存データを読み込めませんでした。元のデータは退避してあります',true);
+  if(recovery) toast(recovery.restored?'中断された読み込みを取り消し、元の棚に戻しました'
+    :'元の棚を表示しています。復旧を保存できないため変更を停止しています。控えを取り、保存領域を空けて再起動してください',!recovery.restored);
+  else if(store.bad) toast('保存データを読み込めませんでした。元の保存データは上書きせず保護しています',true);
   /* 以前は毎起動、無条件に全冊を書き戻していた。書くのは中身が実際に
      変わったとき（旧形式からの移行・normalize による補正）だけでよい */
-  else if(fromPrev||JSON.stringify(books)!==before) await save();
+  const migrate=!store.bad&&!recovery&&(fromPrev||JSON.stringify(books)!==before);
   render();
+  if(migrate) await stateJob(()=>save(books));
   logAct('起動',`${books.length}冊`,performance.now()-T0);
 })();
 </script>

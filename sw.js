@@ -7,7 +7,7 @@
    2. 書誌API（国会図書館・openBD）の応答は絶対にキャッシュしない。
       固定化すると新刊が出てこなくなり、抜け巻検出そのものが嘘になる。 */
 
-const V = 'bookshelf-v3';
+const V = 'bookshelf-v5';
 const SHELL = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 const NEVER = [/ndlsearch\.ndl\.go\.jp/, /api\.openbd\.jp/];        // 触らない
@@ -28,7 +28,9 @@ self.addEventListener('install', e => {
 self.addEventListener('activate', e => {
   e.waitUntil(
     caches.keys()
-      .then(ks => Promise.all(ks.filter(k => k !== V).map(k => caches.delete(k))))
+      // Cache Storage は同じoriginの別アプリも使う。本棚の旧版だけを消す。
+      .then(ks => Promise.all(ks.filter(k => /^bookshelf-v\d+$/.test(k) && k !== V)
+        .map(k => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });
@@ -42,15 +44,17 @@ const trim = () => caches.open(V).then(async c => {
   for (let i = 0; i < covers.length - LIMIT; i++) await c.delete(covers[i]);
 }).catch(() => {});
 
-const put = (req, res) => {
+const put = (req, res, event) => {
   // 不透明な応答（CORSなしの画像）は ok が false になるが、表示には使えるので残す
   if (res && (res.ok || res.type === 'opaque')) {
     const copy = res.clone();
     const url = typeof req === 'string' ? req : req.url;
-    caches.open(V)
+    const job = caches.open(V)
       .then(c => c.put(req, copy))
-      .then(() => { if (COVERS.some(re => re.test(url))) trim(); })
+      .then(() => { if (COVERS.some(re => re.test(url))) return trim(); })
       .catch(() => {});
+    // 応答を返した直後にworkerが休止しても、控えの保存は完了させる。
+    event.waitUntil(job);
   }
   return res;
 };
@@ -72,7 +76,7 @@ self.addEventListener('fetch', e => {
        cache:'reload' で必ず取りに行かせる。ここを緩めると更新が届かなくなる。 */
     e.respondWith(
       fetch(req.url, { cache: 'reload', credentials: 'same-origin' })
-        .then(res => put('./index.html', res))
+        .then(res => put('./index.html', res, e))
         .catch(() => caches.match('./index.html').then(hit => hit || caches.match('./')))
     );
     return;
@@ -81,7 +85,7 @@ self.addEventListener('fetch', e => {
   // 表紙・フォント・自分のファイル：あるものを使い、無ければ取りに行って貯める
   if (url.origin === location.origin || KEEP.some(r => r.test(url.href))) {
     e.respondWith(
-      caches.match(req).then(hit => hit || fetch(req).then(res => put(req, res)))
+      caches.match(req).then(hit => hit || fetch(req).then(res => put(req, res, e)))
     );
   }
 });
