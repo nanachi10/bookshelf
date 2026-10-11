@@ -1,6 +1,7 @@
 """Isolated browser fixtures. Never opens a persistent/user browser profile."""
 import argparse
 import json
+import os
 import subprocess
 from pathlib import Path
 from playwright.sync_api import sync_playwright
@@ -8,6 +9,22 @@ from playwright.sync_api import sync_playwright
 ROOT = Path(__file__).resolve().parents[1]
 URL = 'http://localhost:18763/'
 KEY = 'bookshelf:v3'
+# 手元PC（Windows）の固定版と、Claude Code クラウド環境の同梱版。
+# 同梱版は Python 版 Playwright と版がずれるので、既定の探索に任せず直接指す。
+CHROMIUM_CANDIDATES = [
+    Path.home() / 'AppData/Local/ms-playwright/chromium-1208/chrome-win64/chrome.exe',
+    Path('/opt/pw-browsers/chromium'),
+]
+
+
+def chromium_path():
+    """BOOKSHELF_CHROMIUM > 上の候補 > Playwright 既定。"""
+    env = os.environ.get('BOOKSHELF_CHROMIUM')
+    if env:
+        return env
+    return next((str(c) for c in CHROMIUM_CANDIDATES if c.exists()), None)
+
+
 BASE_BOOK = dict(isbn='9784041010006', title='Fixture 1', series='Fixture',
                  vol=1, author='Author', publisher='Publisher', own='paper',
                  status='stock', added=1)
@@ -21,8 +38,7 @@ def main():
     records = []
     source = subprocess.check_output(['git','show',args.revision+':index.html'],cwd=ROOT) if args.revision else None
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, executable_path=str(
-            Path.home() / 'AppData/Local/ms-playwright/chromium-1208/chrome-win64/chrome.exe'),
+        browser = p.chromium.launch(headless=True, executable_path=chromium_path(),
             args=['--disable-gpu'])
 
         def case(name, seed, check):

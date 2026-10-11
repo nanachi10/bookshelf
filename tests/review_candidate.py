@@ -6,7 +6,7 @@ import json
 import subprocess
 from pathlib import Path
 from playwright.sync_api import sync_playwright
-from review_browser import ROOT, URL, BASE_BOOK, KEY
+from review_browser import ROOT, URL, BASE_BOOK, KEY, chromium_path
 
 META='bookshelf:meta'
 PENDING='bookshelf:pending-import'
@@ -31,8 +31,8 @@ def main():
     source=subprocess.check_output(['git','show',args.revision+':index.html'],cwd=ROOT) if args.revision else None
     reports=[]
     with sync_playwright() as p:
-        browser=p.chromium.launch(headless=True,executable_path=str(Path.home()/
-            'AppData/Local/ms-playwright/chromium-1208/chrome-win64/chrome.exe'),args=['--disable-gpu'])
+        browser=p.chromium.launch(headless=True,executable_path=chromium_path(),
+            args=['--disable-gpu'])
 
         def case(name,fn,seed=None,init=None):
             baseline_cases={

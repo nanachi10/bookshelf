@@ -8,6 +8,7 @@ import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from playwright.sync_api import sync_playwright
+from review_browser import chromium_path
 
 ROOT=Path(__file__).resolve().parents[1]
 VERSION=1
@@ -51,8 +52,7 @@ def main():
     threading.Thread(target=server.serve_forever,daemon=True).start()
     results=[]
     with sync_playwright() as p:
-        browser=p.chromium.launch(headless=True,executable_path=str(
-            Path.home()/'AppData/Local/ms-playwright/chromium-1208/chrome-win64/chrome.exe'),args=['--disable-gpu'])
+        browser=p.chromium.launch(headless=True,executable_path=chromium_path(),args=['--disable-gpu'])
         context=browser.new_context()
         # Avoid routing SW navigations: Chromium offline emulation can otherwise
         # leave a continued route pending. The served fixture has no external assets.

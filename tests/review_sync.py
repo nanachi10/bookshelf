@@ -5,7 +5,7 @@ import argparse
 import json
 from pathlib import Path
 from playwright.sync_api import sync_playwright
-from review_browser import URL, KEY
+from review_browser import URL, KEY, chromium_path
 
 META = 'bookshelf:meta'
 A = dict(isbn='MfixtureA', title='Fixture A', own='paper', status='stock', note='Original', added=1)
@@ -21,8 +21,8 @@ def main():
     output = Path(args.output)
     reports = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, executable_path=str(Path.home() /
-            'AppData/Local/ms-playwright/chromium-1208/chrome-win64/chrome.exe'), args=['--disable-gpu'])
+        browser = p.chromium.launch(headless=True, executable_path=chromium_path(),
+            args=['--disable-gpu'])
 
         def fresh(items=None, meta=None, width=390):
             ctx = browser.new_context(viewport=dict(width=width, height=844), service_workers='block')
