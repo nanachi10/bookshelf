@@ -7,8 +7,8 @@
    2. 書誌API（国会図書館・openBD）の応答は絶対にキャッシュしない。
       固定化すると新刊が出てこなくなり、抜け巻検出そのものが嘘になる。 */
 
-const V = 'bookshelf-v6';
-const SHELL = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
+const V = 'bookshelf-v7';
+const SHELL = ['./', './index.html', './manifest.json', './cloud-shelf-v1.js', './icon-192.png', './icon-512.png'];
 
 const NEVER = [/ndlsearch\.ndl\.go\.jp/, /api\.openbd\.jp/];        // 触らない
 const COVERS= [/images-na\.ssl-images-amazon\.com/,                 // 表紙は貯めてよい

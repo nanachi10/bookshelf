@@ -100,11 +100,11 @@ def main():
                 page.click('#imp')
             chooser.value.set_files(dict(name='fixture.json', mimeType='application/json', buffer=json.dumps(
                 dict(books=[dict(BASE_BOOK, isbn='Msecond', title='Second'),
-                            dict(BASE_BOOK, isbn='Mbad', series={'bad':True})], done=['poison'], sort='title')
+                            dict(BASE_BOOK, isbn='Mbad', series={'bad':True})], done=['poison'], sort='added')
             ).encode()))
             page.wait_for_timeout(100)
             state = page.evaluate('({n:books.length, done:[...doneKeys],sort:sortBy, toast:document.getElementById("toast").textContent})')
-            assert state['n'] == 1 and not state['done'] and state['sort'] == 'added', state
+            assert state['n'] == 1 and not state['done'] and state['sort'] == 'title', state
             return state
         case('invalid_import_is_atomic', {KEY:json.dumps([BASE_BOOK])}, import_atomic)
 
