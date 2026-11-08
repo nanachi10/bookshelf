@@ -20,7 +20,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         name=self.path.split('?')[0].lstrip('/') or 'index.html'
-        if name in ('index.html','sw.js','cloud-shelf-v1.js'):
+        if name in ('index.html','sw.js','cloud-shelf-v2.js'):
             raw=SOURCE.get(name) or (ROOT/name).read_bytes()
             if name=='index.html':
                 # SW-owned requests bypass Playwright routing. Remove external font/

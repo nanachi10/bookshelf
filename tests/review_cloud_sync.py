@@ -1,5 +1,6 @@
 from pathlib import Path
-import json,base64,threading,functools,sys
+import json,base64,threading,functools,hashlib
+from urllib.parse import urlsplit,parse_qs
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from playwright.sync_api import sync_playwright, expect
 ROOT=Path(__file__).resolve().parents[1]
@@ -25,11 +26,26 @@ with sync_playwright() as pw:
  pages=[]
  for opts in ({},pw.devices['Pixel 7']):
   ctx=b.new_context(service_workers='block',**opts)
-  ctx.route('https://api.github.com/**',api)
+  login='https://shelf-test.invalid'
+  ctx.route('**/login-service.json',lambda route:route.fulfill(json={'origin':login}))
+  def handle(route):
+   req=route.request
+   parsed=urlsplit(req.url)
+   if parsed.path=='/auth/start':
+    global challenge
+    challenge=parse_qs(parsed.query)['challenge'][0]
+    route.fulfill(status=302,headers={'Location':url+'#shelf-login='+'t'*43})
+   elif parsed.path=='/auth/exchange':
+    proof=req.post_data_json['verifier'].encode()
+    assert base64.urlsafe_b64encode(hashlib.sha256(proof).digest()).decode().rstrip('=')==challenge
+    route.fulfill(json={'session':'s'*43})
+   else:
+    assert req.headers['authorization']=='Bearer '+'s'*43
+    api(route)
+  ctx.route(login+'/**',handle)
   p=ctx.new_page();p.goto(url,wait_until='domcontentloaded')
-  p.locator('#cloudstatus').click();p.locator('#cloudaccess').fill('github_pat_fixture');p.locator('#cloudgo').click()
+  p.locator('#cloudstatus').click();p.locator('#cloudgo').click()
   expect(p.locator('#cloudstatus')).to_have_text('同期済み')
-  p.evaluate('closeSheet()')
   pages.append(p)
  pc,mobile=pages
  for p in pages:
