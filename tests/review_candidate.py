@@ -413,6 +413,41 @@ def main():
             return 'visible cancel leaves input and prevents unconfirmed batch commit'
         case('bulk_cancel_leaves_input_and_disables_unconfirmed_commit',cancel_bulk)
 
+        def bulk_draft(page):
+            page.evaluate('openBulkInput()')
+            page.fill('#blines','作品 3巻,5巻')
+            page.reload()
+            page.evaluate('openBulkInput()')
+            assert page.input_value('#blines')=='作品 3巻,5巻'
+            page.evaluate('''()=>{searchSeriesAll=async name=>[3,5].map(v=>({
+              ak:'ed'+v,pk:'',count:1,label:'版'+v,items:[{vol:v,title:name,series:name,isbn:'M'+v}]}))}''')
+            page.click('#bgo')
+            page.wait_for_selector('#bmissing0')
+            assert '5巻' in page.inner_text('#bmissing0')
+            page.select_option('[data-be="0"]','ed5|')
+            assert '3巻' in page.inner_text('#bmissing0')
+            page.fill('#blines','作品 8巻')
+            assert page.locator('#bcommit').count()==0
+            assert page.evaluate('rangeVols(parseLine("作品 8巻").range)')==[8]
+            assert page.evaluate('rangeVols(parseLine("作品 8").range)')==list(range(1,9))
+            return 'draft restored, missing volume shown for each edition, editing discards old results'
+        case('bulk_draft_and_missing_volumes',bulk_draft)
+
+        def bulk_two_thousand(page):
+            page.evaluate('''()=>{searchSeriesAll=async name=>[{
+              ak:'author',pk:'',count:50,items:Array.from({length:50},(_,i)=>({
+              isbn:'M'+name+'-'+i,title:name+' '+(i+1),series:name,vol:i+1,author:'作者'}))}];openBulkInput()}''')
+            page.fill('#blines','\n'.join('棚作品%d 1-50'%i for i in range(40)))
+            page.click('#bgo')
+            page.wait_for_function('!document.querySelector("#bcommit").disabled')
+            page.click('#bcommit')
+            page.wait_for_function('books.length===2001')
+            page.reload()
+            page.wait_for_function('books.length===2001')
+            assert page.evaluate('new Set(books.map(b=>b.isbn)).size')==2001
+            return '40 lines added 2000 distinct books and retained the seeded book across reload'
+        case('bulk_two_thousand_books_survive_reload',bulk_two_thousand)
+
         def cover_image_failure(page):
             before=page.evaluate('JSON.stringify(books)')
             page.evaluate('''()=>{const image=document.createElement('img');image.dataset.b=books[0].isbn;

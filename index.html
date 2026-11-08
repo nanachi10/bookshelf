@@ -2213,6 +2213,13 @@ function parseRange(spec){
 function parseLine(line){
   const t=norm(line||'').trim();
   if(!t) return null;
+  // 「8」は従来どおり1〜8巻。「8巻」はその1冊を指定できる。
+  const marked=t.match(/^(.+?)\s+((?:\d{1,3}(?:\s*[-–—〜~ー]\s*\d{1,3})?巻?\s*[,、]\s*)*\d{1,3}(?:\s*[-–—〜~ー]\s*\d{1,3})?巻)$/);
+  if(marked){
+    const spec=marked[2].replace(/巻/g,'');
+    const range=/^\d+$/.test(spec)?{from:null,to:null,list:new Set([+spec])}:parseRange(spec);
+    return {name:marked[1],range};
+  }
   const m=t.match(/^(.*?)[\s　]+([\d\-–—〜～~,、\s]+)$/);
   if(!m) return {name:t, range:null};
   const range=parseRange(m[2]);
@@ -2234,9 +2241,10 @@ function openBulkInput(){
     <h2>まとめて入力</h2>
     <p class="meta">1行に1作品、題名だけでかまいません。調べたあとに、
       見つかった巻の範囲をプルダウンで選んでから棚に入れます。
-      題名のあとに巻を書いておくと、それが選択の初期値になります（例：よつばと! 16）。</p>
+      「亜人ちゃん 1-11」で全11冊、「作品名 1-5,8,10-12」で飛び巻、「作品名 8巻」で8巻だけを指定できます。</p>
     <div class="field" style="margin-top:12px">
       <textarea id="blines" rows="6" placeholder="オーバーロード 1-15&#10;よつばと! 16"></textarea></div>
+    <p class="meta" id="bdraft" role="status"></p>
     <div id="bprev"></div>
     <div class="lab">持ちかた</div>
     <div class="seg" id="bo">${OWNS.map(o=>
@@ -2251,7 +2259,12 @@ function openBulkInput(){
   /* どう読み取られたかを打ちながら見せる。
      「1-5,8」の書き損じに、入れてしまってから気づくのでは遅い */
   const blines=document.getElementById('blines'), bprev=document.getElementById('bprev');
-  blines.addEventListener('input',()=>{
+  const draftKey='bookshelf:bulk-input', draft=document.getElementById('bdraft');
+  try{
+    blines.value=localStorage.getItem(draftKey)||'';
+    draft.textContent=blines.value?'前回の入力を復元しました':'入力はこの端末に下書き保存されます';
+  }catch(e){ draft.textContent='この端末で下書きを読み込めません'; }
+  const preview=()=>{
     const lines=blines.value.split(/\r?\n/).map(parseLine).filter(Boolean);
     bprev.innerHTML=!lines.length?'':
       `<div class="lab">読み取り</div><div class="rows">`+lines.map(l=>{
@@ -2261,6 +2274,21 @@ function openBulkInput(){
           : `1〜${r.to}巻`;
         return `<div class="r"><span>${esc(l.name)}</span><span>${esc(t)}</span></div>`;
       }).join('')+`</div>`;
+  };
+  preview();
+  blines.addEventListener('input',()=>{
+    try{
+      if(blines.value) localStorage.setItem(draftKey,blines.value);
+      else localStorage.removeItem(draftKey);
+      draft.textContent=blines.value?'この端末に下書き保存済み':'下書きは空です';
+    }catch(e){ draft.textContent='下書きを保存できません。閉じる前に入力をコピーしてください'; }
+    if(document.getElementById('bres').childElementCount){
+      viewJobs.get('bulk')?.abort(); bulkSeq++;
+      document.getElementById('bres').replaceChildren();
+      document.getElementById('bcancel').hidden=true;
+      document.getElementById('bgo').disabled=false;
+    }
+    preview();
   });
   document.getElementById('bgo').onclick=runBulkInput;
 }
@@ -2300,7 +2328,7 @@ async function runBulkInput(){
     if(!r.eds.length) return `<div class="rows"><div class="r"><span>${esc(r.name)}</span>
       <span style="color:var(--alert)">${r.err?'通信が届きませんでした':'見つかりませんでした'}</span></div></div>`;
     // 小説と漫画が同居する題名は、どの版を入れるか選ばせる
-    const multi=r.eds.filter(e=>e.ak&&e.count>=2);
+    const multi=r.eds.filter(e=>e.count);
     const edSel=multi.length>1
       ? `<div class="field" style="margin:2px 0 4px"><select data-be="${r.i}">${multi.map(e=>
           `<option value="${esc(e.ak+'|'+e.pk)}"${r.edSel===e.ak+'|'+e.pk?' selected':''}>${
@@ -2314,26 +2342,9 @@ async function runBulkInput(){
     // 題名に書いた範囲は初期値として反映する
     const from=r.range?(r.range.list?Math.min(...r.range.list):r.range.from):vols[0];
     const to  =r.range?(r.range.list?Math.max(...r.range.list):r.range.to):null;
-    /* 書いた巻がこの版に無く、別の版にあることがある。
-       「よつばと!」は版元が移ってアスキー・メディアワークス版とKADOKAWA版に分かれ、
-       13巻以降は後者にしか無い。黙って「追加できる巻なし」で終わらせず、
-       どちらを選べばよいか伝える。 */
-    let note='';
-    const cur=edOf(r);
-    if(r.range&&cur&&r.eds.length>1){
-      const here=new Set(vols);
-      const miss=rangeVols(r.range).filter(v=>!here.has(v));
-      if(miss.length){
-        const alt=r.eds.filter(e=>e!==cur)
-          .map(e=>({e, n:miss.filter(v=>e.items.some(x=>x.vol===v)).length}))
-          .sort((a,b)=>b.n-a.n)[0];
-        if(alt&&alt.n) note=`<p class="meta" style="margin:0 0 4px">${
-          esc(runs(miss))}巻はこの版にありません。<b>${esc(alt.e.label)}</b>にあります（上で選べます）。</p>`;
-      }
-    }
     return `<div class="lab">${esc(items[0]&&items[0].series||r.name)}
         <span style="float:right" id="bn${r.i}"></span></div>`
-      +(r.err?`<p class="meta" style="color:var(--alert)">${esc(errText(r.eds.error))}</p>`:'')+edSel+note
+      +(r.err?`<p class="meta" style="color:var(--alert)">${esc(errText(r.eds.error))}</p>`:'')+edSel
       +`<div class="field" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <select data-bf="${r.i}">${vols.map(v=>
           `<option value="${v}"${v===from?' selected':''}>${v}</option>`).join('')}</select>
@@ -2342,7 +2353,7 @@ async function runBulkInput(){
           vols.slice().reverse().map(v=>
           `<option value="${v}"${to===v?' selected':''}>${v}巻</option>`).join('')}</select>
         <span class="meta" style="white-space:nowrap">まで</span>
-      </div>`;
+      </div><p class="meta" id="bmissing${r.i}" hidden></p>`;
   };
   /* 全作品を調べ終わるまで待たせない。行の枠を先に出し、終わった作品から
      順に埋める。利用者は待っている間に、済んだ行の範囲や版を選び始められる */
@@ -2351,36 +2362,49 @@ async function runBulkInput(){
         <span>${esc(l.name)}</span><span style="color:var(--dim)">調べています…</span></div></div></div>`).join('')
     +`<button class="bulk done" id="bcommit" disabled>調べています…（0/${lines.length}）</button>`;
   // いま選んでいる範囲で実際に入る巻（棚にある巻・書いた範囲の外は数えない）
+  const knownISBNs=new Set(books.map(b=>b.isbn));
   const pickOf=r=>{
     const f=+((box.querySelector(`[data-bf="${r.i}"]`)||{}).value||1);
     const t=((box.querySelector(`[data-bt="${r.i}"]`)||{}).value)||'all';
     return itemsOf(r).filter(x=>x.vol>=f&&(t==='all'||x.vol<=+t)
       &&((r.dirty||!r.range)?true:inRange(x.vol,r.range))   // 触ったらプルダウン優先
-      &&!books.some(b=>b.isbn===x.isbn));
+      &&!knownISBNs.has(x.isbn));
   };
-  const counts=()=>bulkFound.forEach(r=>{
+  const countRow=r=>{
     const el=document.getElementById('bn'+r.i);
     if(el) el.textContent=pickOf(r).length+'冊';
-  });
-  counts();
+    const msg=document.getElementById('bmissing'+r.i);
+    if(!msg) return;
+    const have=new Set(itemsOf(r).map(x=>x.vol));
+    const missing=r.range&&!r.dirty?rangeVols(r.range).filter(v=>!have.has(v)):[];
+    msg.textContent=missing.length?'指定したうち、この版で見つからない巻：'+runs(missing)+'巻':'';
+    if(missing.length){
+      for(const ed of r.eds.filter(e=>e!==edOf(r))){
+        const found=missing.filter(v=>ed.items.some(x=>x.vol===v));
+        if(found.length) msg.textContent+=`。${runs(found)}巻は「${ed.label}」で選べます`;
+      }
+    }
+    msg.hidden=!missing.length;
+  };
   box.onchange=e=>{
     const be=e.target.dataset.be;
     if(be!=null){                            // 版を替えたら、その行を引き直す
       const r=bulkFound[+be];
-      r.edSel=e.target.value; r.dirty=true;
+      r.edSel=e.target.value; r.dirty=false;
       document.getElementById('brow'+r.i).innerHTML=rowHTML(r);
-      counts(); return;
+      countRow(r); return;
     }
     const i=e.target.dataset.bf!=null?e.target.dataset.bf:e.target.dataset.bt;
     if(i==null) return;
     bulkFound[+i].dirty=true;
-    counts();
+    countRow(bulkFound[+i]);
   };
   document.getElementById('bcommit').onclick=async()=>{
     const btn=document.getElementById('bcommit');
     btn.disabled=true; btn.textContent='入れています…';
     const selected=bulkFound.map(r=>({r,want:pickOf(r)}));
-    const got=await addMany(selected.flatMap(x=>x.want),addOwn);
+    const own=addOwn;
+    const got=await addMany(selected.flatMap(x=>x.want),own);
     if(!got){ btn.disabled=false; btn.textContent='もう一度、選んだ巻を棚に入れる'; return; }
     const ids=new Set(got.map(b=>b.isbn)), counted=new Set(), total=got.length;
     const done=selected.map(({r,want})=>{
@@ -2388,12 +2412,13 @@ async function runBulkInput(){
       return [(itemsOf(r)[0]||{}).series||r.name,r.eds.length?(n?`${n}冊追加`:'追加できる巻なし'):'見つかりませんでした',n>0];
     });
     fillCoversFor(got);          // 表紙はあとから届けばよい。待たせない
-    logAct('まとめて入力',`${bulkFound.length}作品｜${total}冊`);
+    logAct('まとめて入力',`${selected.length}作品｜${total}冊`);
+    if(seq!==bulkSeq||!job.current()) return;
     box.innerHTML=`<div class="lab">結果</div><div class="rows">`
       + done.map(([a,b,ok])=>`<div class="r"><span>${esc(a)}</span>
           <span style="color:${ok?'var(--jade)':'var(--alert)'}">${esc(b)}</span></div>`).join('')
       + `</div>`;
-    toast(total?`${total}冊を${ownLabel(addOwn)}で追加しました`:'追加できませんでした',!total);
+    toast(total?`${total}冊を${ownLabel(own)}で追加しました`:'新しく追加する巻はありません');
   };
 
   // 最大2作品だけ並行に調べる。行順を保ち、次の開始を250ms空ける。
@@ -2410,7 +2435,7 @@ async function runBulkInput(){
       const r={i,name,range,eds,edSel:eds[0]?eds[0].ak+'|'+eds[0].pk:null,err:!!eds.error,dirty:false};
       bulkFound[i]=r; completed++;
       const row=document.getElementById('brow'+i); if(row) row.innerHTML=rowHTML(r);
-      counts();
+      countRow(r);
       const btn=document.getElementById('bcommit'); if(btn) btn.textContent=`調べています…（${completed}/${lines.length}）`;
     }
   };
