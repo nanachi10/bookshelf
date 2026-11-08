@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="referrer" content="no-referrer"><title>共有の本棚</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f7f4ed;color:#312c24;font:16px/1.6 system-ui,sans-serif}main{max-width:1200px;margin:auto;padding:24px}header{border-bottom:2px solid #a78967;margin-bottom:20px}h1{font: bold 32px serif;margin:0}input{width:min(100%,440px);font:inherit;padding:8px 12px;border:1px solid #968875;border-radius:6px}ul{list-style:none;padding:0;display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:24px 14px}li{min-width:0;font-size:14px}li div{aspect-ratio:2/3;background:#e9e2d3;display:grid;place-items:center;color:#79694e}img{width:100%;height:100%;object-fit:contain;min-height:0}strong,small{display:block;overflow-wrap:anywhere}strong{margin-top:6px}
+</style><main><header><h1>共有の本棚</h1><p id="count" role="status">読み込み中…</p></header><input id="query" type="search" aria-label="書名・著者で検索" placeholder="書名・著者で検索" hidden><ul id="shelf"></ul></main>
+<script type="module">
+const count = document.querySelector('#count');
+const query = document.querySelector('#query');
+const shelf = document.querySelector('#shelf');
+function render(books) {
+  const needle = query.value.trim().normalize('NFKC').toLowerCase();
+  const matches = books.filter(book => (book.title + ' ' + book.author).normalize('NFKC').toLowerCase().includes(needle));
+  count.textContent = needle ? matches.length + '冊 / 全' + books.length + '冊' : books.length + '冊';
+  const items = matches.map(book => {
+    const item = document.createElement('li');
+    const cover = document.createElement('div');
+    cover.textContent = '表紙なし';
+    if (book.cover?.startsWith('https://')) {
+      const img = new Image();
+      img.loading = 'lazy';
+      img.alt = '';
+      img.onerror = () => { cover.textContent = '表紙なし'; };
+      img.src = book.cover;
+      cover.replaceChildren(img);
+    }
+    const title = document.createElement('strong');
+    title.textContent = book.title;
+    const author = document.createElement('small');
+    author.textContent = book.author;
+    item.append(cover, title, author);
+    return item;
+  });
+  shelf.replaceChildren(...items);
+}
+try {
+  const rawKey = Uint8Array.from(atob(location.hash.slice(1).replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0));
+  const key = await crypto.subtle.importKey('raw', rawKey, 'AES-GCM', false, ['decrypt']);
+  const response = await fetch('./shelf.bin');
+  if (!response.ok) throw Error();
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  const data = await crypto.subtle.decrypt({name:'AES-GCM',iv:bytes.slice(0,12)},key,bytes.slice(12));
+  const books = JSON.parse(new TextDecoder().decode(data));
+  render(books);
+  query.hidden = false;
+  query.oninput = () => render(books);
+} catch {
+  count.textContent = '本棚を開けませんでした。共有リンクを末尾までコピーして開き直してください。';
+}
+</script></html>
