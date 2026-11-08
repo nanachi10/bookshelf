@@ -409,9 +409,11 @@ async function restorePending(record){
   if(!cleared){ store.blocked.add(KEY); store.blocked.add(META); }
   return !!cleared;
 }
-async function importState(incoming,data){
+async function importState(incoming,data,signature=null){
   return stateJob(async()=>{
     if(store.blocked.has(KEY)||store.blocked.has(META)||store.blocked.has(PENDING)) return false;
+    if(signature!==null&&(syncSignature()!==signature||syncStoredSignature(await syncStorage())!==signature))
+      throw new Error('棚が変わりました。再読み込みしてから一覧を確認してください');
     const seen=new Set(books.map(b=>b.isbn)), next=books.slice(), nextMeta=JSON.parse(JSON.stringify(metaSnapshot()));
     incoming.forEach(b=>{ if(!seen.has(b.isbn)){ next.push(b); seen.add(b.isbn); } });
     next.sort((x,y)=>(y.added||0)-(x.added||0));
@@ -421,6 +423,10 @@ async function importState(incoming,data){
       if(data.dir===1||data.dir===-1) nextMeta.dir=data.dir;
     }
     const added=next.length-books.length;
+    if(signature!==null){
+      if(!await save(next)) return false;
+      books=next; return {added};
+    }
     return await writeShelfState(next,nextMeta)?{added}:false;
   });
 }
@@ -2964,6 +2970,7 @@ document.getElementById('more').onclick=()=>{
     <h2>棚をあつかう</h2>
     <div class="lab">入れる</div>
     <div class="menu">
+      <button id="photoimport">写真から作った一覧を追加</button>
       <button id="binput">まとめて入力（題名と巻数で）</button>
       <button id="usb">連続スキャン（USBリーダー）</button>
     </div>
@@ -3002,6 +3009,7 @@ document.getElementById('more').onclick=()=>{
   document.getElementById('devicesync').onclick=openDeviceSync;
   document.getElementById('tidy').onclick=()=>openTidy();
   document.getElementById('oplog').onclick=()=>openLog();
+  document.getElementById('photoimport').onclick=openPhotoImport;
   document.getElementById('binput').onclick=()=>openBulkInput();
   document.getElementById('usb').onclick=()=>openScanUSB();
   document.getElementById('new').onclick=()=>checkNew();
@@ -3022,43 +3030,87 @@ document.getElementById('more').onclick=()=>{
     inp.onchange=async()=>{
       try{
         const data=JSON.parse(await inp.files[0].text());
-        // 旧形式（配列そのまま）と新形式（{books,done,sort}）の両方を受ける
-        const list=Array.isArray(data)?data:(data&&Array.isArray(data.books)?data.books:null);
-        if(!list) throw 0;
-        const incoming=list.map(normalize);
-        if(store.blocked.has(KEY)||store.blocked.has(META)) throw new Error('保存データの復旧が必要です');
-        const seen=new Set(books.map(b=>b.isbn)), unique=[], repeated=[], held=[];
-        incoming.forEach(b=>{
-          if(seen.has(b.isbn)){ repeated.push(b); return; }
-          if(classificationIssue(b)){ held.push({title:b.title,reason:'短編集・Exの題名と登録シリーズ・巻が一致しません。確認してから読み込んでください'}); return; }
-          const overlap=!isISBN13(b.isbn)&&b.series&&b.vol&&books.concat(unique).some(x=>
-            mkey(x.series||'')===mkey(b.series)&&x.vol===b.vol&&(!b.author||!x.author||akey(x.author)===akey(b.author)));
-          if(overlap){ held.push({title:b.title,reason:'同じ巻が棚にあります。ISBN・版を確認してください'}); return; }
-          unique.push(b); seen.add(b.isbn);
-        });
-        const pending=held.concat(!Array.isArray(data)&&Array.isArray(data.pending)?data.pending:[]);
-        openWith(`<h2>読み込む前に確認</h2>
-          <p class="meta">新しく入る${unique.length}冊／同じISBN${repeated.length}件は追加しません。
-          既存の本のメモ・読書状態は上書きしません。${pending.length?`未確定・要確認の${pending.length}件は保留します。`:''}</p>
-          <div class="rows">${unique.slice(0,80).map(b=>`<div class="r"><span>${esc(b.title)}</span><span>${esc(b.author)} ${b.vol?b.vol+'巻':''}</span></div>`).join('')}
-          ${unique.length>80?`<p class="meta">ほか${unique.length-80}冊</p>`:''}</div>
-          ${pending.length?`<details><summary>保留する候補</summary><p class="meta">${pending.slice(0,80).map(b=>esc(String(b&&b.title||'書名未確定'))+(b&&b.reason?'：'+esc(b.reason):'')).join('<br>')}</p></details>`:''}
-          <p class="meta">読み込む前に元の棚をJSONで書き出してください。未確定の候補は追加しません。</p>
-          <div class="acts"><button id="importbackup" class="ghost2">元の棚をJSONで書き出す</button>
-          <button id="importcommit" class="save">確認した内容を読み込む</button></div>`);
-        document.getElementById('importbackup').onclick=exportJSON;
-        document.getElementById('importcommit').onclick=async e=>{
-          const btn=e.currentTarget; btn.disabled=true;
-          const result=await importState(unique,data);
-          if(!result){ btn.disabled=false; toast('読み込みを保存できませんでした。元の棚は変えていません。控えと保存領域を確認してください',true); return; }
-          render(); closeSheet(); toast(`${result.added}冊を読み込みました（重複・未確定は追加していません）`);
-          logAct('読み込み',`${unique.length}冊｜重複${repeated.length}件｜保留${pending.length}件`);
-        };
+        previewImport(data,false);
       }catch(e){ toast('このファイルは読み込めません',true); }
     };
     inp.click();
   };
 };
+// 写真を照合した書誌を、この端末の棚に追加する。写真そのものは扱わない。
+function openPhotoImport(){
+  openWith(`<h2>写真から作った一覧を追加</h2>
+    <label for="photojson">書誌一覧のJSONを貼り付ける</label>
+    <textarea id="photojson" rows="5"></textarea>
+    <label for="photofile">またはJSONファイルを選ぶ</label>
+    <input type="file" id="photofile" accept=".json,application/json">
+    <div class="acts"><button id="photopreview" class="save">追加内容を確認</button></div>
+    <p class="meta" id="photoerror" role="status"></p>`);
+  const file=document.getElementById('photofile'), input=document.getElementById('photojson');
+  input.oninput=()=>{file.value='';};
+  file.onchange=()=>{if(file.files.length) input.value='';};
+  document.getElementById('photopreview').onclick=async()=>{
+    try{ previewImport(JSON.parse(file.files.length?await file.files[0].text():input.value),true); }
+    catch(e){document.getElementById('photoerror').textContent='書誌一覧を読み込めません。ISBNと書名を含むJSONを確認してください。';}
+  };
+}
+function importRows(items){
+  const groups=new Map();
+  for(const b of items){
+    const label=[b.series||b.title,b.editionLabel,b.author,b.publisher].filter(Boolean).join(' ／ ');
+    if(!groups.has(label)) groups.set(label,[]);
+    groups.get(label).push(b);
+  }
+  return [...groups].map(([label,items])=>`<details><summary>${esc(label)}（${items.length}冊）</summary>
+    ${items.map(b=>`<div class="r"><span>${esc(b.title)}</span><span>${esc(b.isbn)}</span></div>`).join('')}</details>`).join('');
+}
+function previewImport(data,photo){
+  // 旧形式（配列そのまま）と新形式（{books,done,sort}）の両方を受ける
+  const list=Array.isArray(data)?data:(data&&Array.isArray(data.books)?data.books:null);
+  if(!list) throw 0;
+  const incoming=list.map(normalize);
+  if(store.blocked.has(KEY)||store.blocked.has(META)) throw new Error('保存データの復旧が必要です');
+  const seen=new Set(books.map(b=>b.isbn)), unique=[], repeated=[], held=[];
+  const volumes=new Map();
+  const volumeKey=b=>JSON.stringify([mkey(b.series),b.vol]);
+  function indexVolume(b){
+    if(!b.series||!b.vol) return;
+    const key=volumeKey(b);
+    if(!volumes.has(key)) volumes.set(key,new Set());
+    volumes.get(key).add(akey(b.author));
+  }
+  books.forEach(indexVolume);
+  incoming.forEach(b=>{
+    if(seen.has(b.isbn)){ repeated.push(b); return; }
+    if(photo&&!isISBN13(b.isbn)){ held.push({title:b.title,reason:'ISBNを確認してください'}); return; }
+    if(classificationIssue(b)){ held.push({title:b.title,reason:'短編集・Exの題名と登録シリーズ・巻が一致しません。確認してから読み込んでください'}); return; }
+    const authors=(photo||!isISBN13(b.isbn))&&volumes.get(volumeKey(b));
+    const overlap=authors&&(!b.author||authors.has('')||authors.has(akey(b.author)));
+    if(overlap){ held.push({title:b.title,reason:'同じ巻が棚にあります。ISBN・版を確認してください'}); return; }
+    unique.push(b); seen.add(b.isbn); indexVolume(b);
+  });
+  const pending=held.concat(!Array.isArray(data)&&Array.isArray(data.pending)?data.pending:[]);
+  const signature=photo?syncSignature():null;
+  const examples=[...new Set(books.map(b=>b.series||b.title))].slice(0,4);
+  openWith(`<h2>読み込む前に確認</h2>
+    <p>登録先はこのブラウザーの棚（現在${books.length}冊）</p>
+    <p class="meta">${examples.map(esc).join(' ／ ')}</p>
+    <p>新しく入る${unique.length}冊 ／ 同じISBN${repeated.length}件 ／ 未確定・要確認の${pending.length}件は保留します。</p>
+    ${importRows(unique)}
+    ${repeated.length?`<details><summary>重複で見送る本</summary>${importRows(repeated)}</details>`:''}
+    ${pending.length?`<details><summary>保留する候補</summary><p class="meta">${pending.map(b=>esc(String(b&&b.title||'書名未確定'))+(b&&b.reason?'：'+esc(b.reason):'')).join('<br>')}</p></details>`:''}
+    <div class="acts"><button id="importbackup" class="ghost2">元の棚をJSONで書き出す</button>
+    <button id="importcommit" class="save" ${photo&&!unique.length?'disabled':''}>確認した内容を読み込む</button></div>`);
+  document.getElementById('importbackup').onclick=exportJSON;
+  document.getElementById('importcommit').onclick=async e=>{
+    const btn=e.currentTarget; btn.disabled=true;
+    try{
+      const result=await importState(unique,photo?unique:data,signature);
+      if(!result) throw new Error('読み込みを保存できませんでした。保存領域と棚の状態を確認してください');
+      render(); closeSheet(); toast(`${result.added}冊を読み込みました（重複・未確定は追加していません）`);
+      logAct('読み込み',`${result.added}冊｜重複${repeated.length}件｜保留${pending.length}件`);
+    }catch(error){btn.disabled=false; toast(error.message,true);}
+  };
+}
 /* ══ まとめて棚から出す（棚全体から） ══
    版を取り違えて丸ごと入ってしまったときは、作品ごと外したい。
    束を選んでから消す。巻単位で選びたいときはシリーズ画面へ回す。 */

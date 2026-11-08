@@ -150,6 +150,27 @@ def main():
             return state
         case('photo_preview_duplicate_and_ambiguity_hold',import_preview)
 
+        def photo_paste(page):
+            new=dict(BOOK2,isbn='9780306406157',editionLabel='漫画')
+            payload=dict(books=[new,new,dict(BOOK2,isbn='Mmanual')],sort='title')
+            def preview():
+                page.click('#more')
+                page.click('#photoimport')
+                page.fill('#photojson',json.dumps(payload))
+                page.click('#photopreview')
+            preview()
+            text=page.locator('#card').inner_text()
+            assert '現在1冊' in text and '新しく入る1冊' in text and '同じISBN1件' in text and '漫画' in text,text
+            page.click('#importcommit')
+            page.wait_for_function('books.length===2')
+            page.reload()
+            page.wait_for_function('books.length===2')
+            assert page.evaluate('sortBy')=='added'
+            preview()
+            assert page.locator('#importcommit').is_disabled()
+            return 'paste, edition preview, preserved settings, reload and duplicate-only retry'
+        case('photo_paste_appends_once',photo_paste)
+
         def import_meta_failure(page):
             load_preview(page,dict(books=[BOOK2],done=['fixture|author'],sort='title',dir=-1))
             before=page.evaluate(SNAPSHOT)
