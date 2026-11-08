@@ -281,6 +281,10 @@ main.still .series,main.still .book{animation:none}
 .sync-check{display:flex;align-items:center;gap:8px;min-height:44px;font-size:14px;overflow-wrap:anywhere}
 .sync-check input{flex-shrink:0;width:20px;height:20px}
 #syncresult,#syncmessage{white-space:pre-wrap;overflow-wrap:anywhere}
+.viewbar,#shelfviews{display:flex;align-items:center;gap:5px;flex-wrap:wrap}.viewbar{justify-content:space-between;margin-top:6px}
+.spinerow{display:flex;align-items:flex-end;flex-wrap:wrap;gap:6px;background:repeating-linear-gradient(0deg,transparent 0 169px,#937354 169px 175px)}
+.book.spine{writing-mode:vertical-rl;text-align:start;width:39px;height:169px;overflow:hidden;padding:9px 7px;border:1px solid #ab9271;border-bottom:6px solid #86603e;border-radius:4px 4px 2px 2px;background:#eadcc2;color:#352719;font:600 14px/1.4 serif;content-visibility:visible}
+.spine span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-height:146px}.coverwall .a{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 </style>
 </head>
 <body>
@@ -291,6 +295,7 @@ main.still .series,main.still .book{animation:none}
   <input class="search" id="q" type="search" placeholder="棚の中を絞り込む（タイトル・著者・場所）"
     aria-label="棚の中を絞り込む" autocomplete="off">
   <div class="chips" id="chips"></div>
+  <div class="viewbar"><div id="shelfviews" aria-label="棚の表示"></div><button id="cloudstatus" class="chip">端末を接続</button></div>
 </header>
 
 <main id="main"></main>
@@ -314,6 +319,7 @@ main.still .series,main.still .book{animation:none}
   <button class="sheetx" id="sheetx" aria-label="閉じる">×</button></div>
 <div class="toast" id="toast"></div>
 
+<script src="cloud-shelf-v1.js"></script>
 <script>
 /* ══════════════════════════════════════════════════════════════
    保存先：Claudeのプレビュー内では window.storage、
@@ -384,7 +390,18 @@ const store={
 const save=(next=books)=>{ buildCache=null; return store.set(KEY,next); };
 // 非同期保存中の別操作も直列にする。失敗した候補を棚や履歴へ反映しない。
 let stateQueue=Promise.resolve();
-const stateJob=fn=>{ const p=stateQueue.then(fn); stateQueue=p.catch(()=>{}); return p; };
+const stateJob=fn=>{
+  const p=stateQueue.then(()=>{
+    if(typeof shelfChangedInOtherTab!=='undefined'&&shelfChangedInOtherTab){
+      toast('別のタブで変更されました。再読み込みしてから編集してください',true);
+      return false;
+    }
+    return fn();
+  });
+  stateQueue=p.catch(()=>{});
+  if(typeof scheduleShelfSync==='function') p.then(scheduleShelfSync,()=>{});
+  return p;
+};
 async function changeBooks(make){
   return stateJob(async()=>{
     const next=make(books);
@@ -1215,18 +1232,34 @@ const SORTS=[
   {id:'buy',   label:'買う巻が多い順', pick:g=>-g.buy.length},
   {id:'rate',  label:'評価の高い順', pick:g=>-Math.max(...g.items.map(b=>b.rate||0))}
 ];
-let sortBy='added', sortDir=1;
+let sortBy='title', sortDir=1;
 const sortLabel=()=>((SORTS.find(s=>s.id===sortBy)||SORTS[0]).label)+(sortDir<0?'（逆順）':'');
 // 題名は文字コード順だと「よ」が「オ」より前に来てしまうので、日本語の並びで比べる
 const cmp=(a,b)=>(typeof a==='string'&&typeof b==='string')
-  ? a.localeCompare(b,'ja') : (a<b?-1:a>b?1:0);
+  ? a.localeCompare(b,'ja',{numeric:true}) : (a<b?-1:a>b?1:0);
 function applySort(gs){
   const s=SORTS.find(x=>x.id===sortBy)||SORTS[0];
   return gs.map((g,i)=>[s.pick(g),i,g])
-           .sort((a,b)=>cmp(a[0],b[0])*sortDir||a[1]-b[1])
+           .sort((a,b)=>cmp(a[0],b[0])*sortDir||workOrder(a[2],b[2]))
            .map(z=>z[2]);
 }
 
+const viewNames={cover:'表紙',spine:'背表紙',series:'シリーズ'};
+let shelfView=localStorage.getItem('bookshelf:layout')||'cover';
+if(!Object.hasOwn(viewNames,shelfView)) shelfView='cover';
+document.getElementById('shelfviews').onclick=e=>{
+  const layout=e.target.closest('[data-layout]')?.dataset.layout;
+  if(!viewNames[layout]) return;
+  shelfView=layout; localStorage.setItem('bookshelf:layout',layout); shelfLimit=60; render();
+};
+const jpOrder=new Intl.Collator('ja',{numeric:true,sensitivity:'base'});
+const workName=g=>g.series||g.items[0].title;
+function workOrder(a,b){
+  return jpOrder.compare(workName(a),workName(b))||jpOrder.compare(a.key,b.key);
+}
+function volumeOrder(a,b){
+  return (a.vol??Infinity)-(b.vol??Infinity)||jpOrder.compare(a.title,b.title)||jpOrder.compare(a.isbn,b.isbn);
+}
 let rendered=false, shelfLimit=60;
 const bookSearch=new WeakMap();
 function searchText(b){
@@ -1241,6 +1274,8 @@ function render(){
   // 2回目以降は出現アニメを止める（絞り込みや保存のたびに全カードが跳ねない）
   if(rendered) document.getElementById('main').classList.add('still');
   rendered=true;
+  document.getElementById('shelfviews').innerHTML=Object.entries(viewNames).map(([key,name])=>
+    '<button class="chip '+(shelfView===key?'on':'')+'" aria-pressed="'+(shelfView===key)+'" data-layout="'+key+'">'+name+'</button>').join('');
   const owned=books.filter(b=>b.own!=='none').length;
   const all0=build(books);
   const buy=all0.reduce((n,g)=>n+g.buy.length,0);
@@ -1277,6 +1312,16 @@ function render(){
     return;
   }
 
+  if(shelfView!=='series'){
+    const ordered=applySort(gs).flatMap(g=>g.items.filter(hit).slice().sort(volumeOrder));
+    const cards=ordered.slice(0,shelfLimit).map(b=>{
+      if(shelfView==='spine') return '<button class="book spine" data-isbn="'+esc(b.isbn)+'" title="'+esc(b.title)+'"><span>'+esc(b.title)+'</span></button>';
+      return '<button class="book" data-isbn="'+esc(b.isbn)+'"><div class="jacket">'+jacketImg(b)+pin(b)+'</div><div class="t">'+esc(b.title)+'</div><div class="a">'+esc(b.author)+'</div></button>';
+    });
+    const more=ordered.length>shelfLimit?'<button class="bulk" id="morecards">続きを表示（残り'+(ordered.length-shelfLimit)+'冊）</button>':'';
+    reconcileMain(main,'<div class="'+(shelfView==='spine'?'spinerow':'grid coverwall')+'">'+cards.join('')+'</div>'+more);
+    return;
+  }
   const series=applySort(gs.filter(g=>g.isSeries)), singles=applySort(gs.filter(g=>!g.isSeries));
   const singleBooks=singles.flatMap(g=>g.items), totalRows=series.length+singleBooks.length;
   const visibleSeries=series.slice(0,shelfLimit), visibleSingles=singleBooks.slice(0,Math.max(0,shelfLimit-series.length));
@@ -2311,7 +2356,7 @@ const META='bookshelf:meta';
 /* series: 作品ごとの新刊確認の記録 {gkey:{checkedAt, newVols:[]}}。
    以前は全体で1つの newVols/newAt しか持たず、途中で429に当たると
    それまでの成果が丸ごと捨てられ、次も最初から全作品を調べ直していた。 */
-let meta={done:[],sort:'added',dir:1,exportAt:0,exportN:0,newAt:0,newVols:{},series:{}};
+let meta={done:[],sort:'title',dir:1,exportAt:0,exportN:0,newAt:0,newVols:{},series:{}};
 let doneKeys=new Set();
 // 読み込み済みの値を受け取る形にして、起動時に books と並列で読めるようにする
 function validateMeta(m){
@@ -2347,6 +2392,9 @@ function loadMeta(m){
   }
   doneKeys=new Set(Array.isArray(meta.done)?meta.done:[]);
   if(SORTS.some(x=>x.id===meta.sort)) sortBy=meta.sort;
+  if(!localStorage.getItem('bookshelf:work-order-v1')&&sortBy==='added'&&meta.dir!==-1){
+    sortBy='title';meta.sort='title';meta.dir=1;
+  }
   sortDir=meta.dir===-1?-1:1;
   if(!meta.series||typeof meta.series!=='object'||Array.isArray(meta.series)) meta.series={};
   // 旧形式（全体で1つの newVols）からの引き継ぎ。調べた時刻は全体の newAt を充てる
@@ -3515,11 +3563,11 @@ async function applyShelfSync(plan,choices){
 }
 function openDeviceSync(){
   openWith(`<h2>PC・スマホのデータを合わせる</h2>
-    <p class="meta">現在はファイルを渡す手動同期です。クラウドへの自動同期は未設定です。</p>
+    <p class="meta">ファイルを使って棚を比較します。自動同期は本棚上部の接続ボタンから設定できます。</p>
     <ol class="meta"><li>両方の端末で先に「JSONで書き出す」で控えを保存します。</li>
     <li>片方のJSONをもう片方の端末へ渡し、「受け取ったJSONと比較する」を押します。</li>
     <li>違うメモ・読書状況を確認して反映します。反映後のJSONを元の端末にも戻してください。</li></ol>
-    <p class="meta">同じURLを開くだけでは棚は同期されません。メモもファイルに含まれます。共有先は自分で選んでください。</p>
+    <p class="meta">メモもファイルに含まれます。共有先は自分で選んでください。</p>
     <div class="menu"><button id="syncdownload">JSONで書き出す</button>
     <button id="syncshare">JSONを共有する</button><button id="syncread">受け取ったJSONと比較する</button>
     <button id="syncprevious">直前の反映前の控えを保存する</button></div>
@@ -3755,6 +3803,10 @@ function toast(msg,warn,action){
      変わったとき（旧形式からの移行・normalize による補正）だけでよい */
   const migrate=!store.bad&&!recovery&&(fromPrev||JSON.stringify(books)!==before);
   render();
+  if(!store.bad && !localStorage.getItem('bookshelf:work-order-v1')){
+    if(await store.set(META,metaSnapshot())) localStorage.setItem('bookshelf:work-order-v1','1');
+  }
+  if(typeof initCloudShelf==='function') initCloudShelf(); else document.getElementById('cloudstatus').textContent='同期機能の再読み込みが必要です';
   if(migrate) await stateJob(()=>save(books));
   if(!store.bad){
     let lastReleaseLoad=0;

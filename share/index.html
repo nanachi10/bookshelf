@@ -79,6 +79,9 @@ async function readLink() {
 window.addEventListener('hashchange', () => location.reload());
 try {
   const books = await readLink();
+  const order = new Intl.Collator('ja', {numeric:true,sensitivity:'base'});
+  const work = title => title.normalize('NFKC').replace(/[\s（(]*(?:第\s*)?\d+\s*(?:巻)?[)）]?\s*$/, '').trim();
+  books.sort((a,b) => order.compare(work(a.title),work(b.title)) || order.compare(a.title,b.title) || order.compare(a.author,b.author));
   render(books);
   query.hidden = false;
   query.oninput = () => render(books);
