@@ -374,6 +374,32 @@ def main():
             return 'ISBN evidence matched old shelf despite publisher grouping change; no shelf migration'
         case('stored_isbn_can_resolve_changed_edition_key',edition_isbn_evidence)
 
+        def pick_while_loading(page):
+            page.evaluate("""()=>{window.partitions=0;
+                const rows=[1,2,3].map(vol=>({...books[0],isbn:vol===1?books[0].isbn:'Mvol'+vol,title:'Fixture '+vol,vol}));
+                ndlQuery=({cnt})=>new Promise(resolve=>{window.firstCount=cnt;window.release=()=>resolve(Object.assign(rows,{
+                    coverage:{complete:false,total:90,received:50}}));});
+                ndlSeriesQuery=async()=>{window.partitions++;return rows;};
+            }""")
+            page.click('.series .next')
+            page.click('#found [data-vol="2"]')
+            assert page.locator('#vgo').count()==0
+            page.evaluate('release()')
+            assert '1冊' in page.locator('#vgo').inner_text()
+            assert page.evaluate('[firstCount,partitions]')==[50,0]
+            chip=page.locator('#found [data-vol="3"]')
+            chip.evaluate('(el)=>{window.originalChip=el}')
+            chip.click()
+            assert chip.evaluate('(el)=>el===window.originalChip')
+            page.click('#vmore')
+            assert page.evaluate('partitions')==1
+            assert '2冊' in page.locator('#vgo').inner_text()
+            page.click('#vgo')
+            page.reload()
+            page.wait_for_function('books.length===3')
+            return 'selected before the first response, kept choices through expansion, saved and reopened'
+        case('volume_selection_before_network_and_after_expansion',pick_while_loading)
+
         def bounded_bulk(page):
             state=page.evaluate('''async()=>{
               let active=0,max=0;searchSeriesAll=async name=>{

@@ -754,9 +754,15 @@ async function ndlQuery(p){
     }
     // 同じ題名で候補表示が既に全件受信していれば、検索・巻選択で取り直さない。
     if(p.title&&(p.cnt||200)>25){
-      const suggestion=qcache.get(u.replace(/&cnt=\d+&/,'&cnt=25&'));
-      if(suggestion&&Date.now()-suggestion.t<600000&&suggestion.items?.coverage?.complete&&suggestion.items.length)
-        return suggestion.items;
+      for(const count of [500,200,50,25]){
+        const url=u.replace(/&cnt=\d+&/,'&cnt='+count+'&');
+        const cached=qcache.get(url);
+        if(cached&&Date.now()-cached.t<600000&&cached.items?.coverage?.complete&&cached.items.length)
+          return cached.items;
+        const disk=qd[url];
+        if(disk?.v===QVER&&disk.coverage?.complete&&disk.items.length&&Date.now()-disk.t<21600000)
+          return Object.assign(disk.items.slice(),{coverage:disk.coverage});
+      }
     }
   }
   const entry={t:Date.now()};
@@ -764,12 +770,12 @@ async function ndlQuery(p){
     checkSignal(p.signal);
     if(qcache.get(u)!==entry) return items;
     entry.items=items;
-    /* 端末に残すのは「大きく引いて実際に当たった」応答だけ。
+    /* 巻選択と検索で全件がそろった応答を端末に残す。
        0件を残すと、NDLが一時的に不調で 200＋空を返したときに
        「見つかりませんでした」が6時間固定されてしまう。
        打鍵ごとのサジェスト（cnt=25）も残さない——数が多く、
        古い順の間引きで肝心の全巻リスト（cnt=500）を押し流す。 */
-    if(items.length&&!queryIssue(items)&&(p.isbn||(p.cnt||200)>=200)){ qd[u]={v:QVER,t:Date.now(),items,coverage:items.coverage}; qsave(); }
+    if(items.length&&!queryIssue(items)&&(p.isbn||p.cnt===50||(p.cnt||200)>=200)){ qd[u]={v:QVER,t:Date.now(),items,coverage:items.coverage}; qsave(); }
     return items;
   });
   entry.p=job; qcache.set(u,entry);
@@ -928,12 +934,18 @@ const dedupe=list=>{ const s=new Set();
    丸山くがね＝小説19巻 と 深山フギン＝漫画8巻 が同じ見出し。
    どの版を入れるかは呼び出し側（＝利用者）が選ぶ。
    NDLの上限500件を超える応答は確認未完了として扱う。 */
-async function searchSeriesAll(name,fresh,signal){
+async function searchSeriesAll(name,fresh,signal,firstPageOnly=false){
   let error=null;
   let out=[];
   const q=seriesQuery(name);
-  try{ out=await ndlSeriesQuery({title:q,fresh,signal}); error=queryIssue(out); }catch(e){ if(isCancelled(e,signal)) throw e; error=e; }
-  if(out.length<3){ try{ const more=await ndlQuery({any:q,cnt:200,fresh,signal}); error=error||queryIssue(more); out=out.concat(more); }catch(e){ if(isCancelled(e,signal)) throw e; error=e; } }
+  let canExpand=false;
+  try{
+    out=firstPageOnly?await ndlQuery({title:q,cnt:50,fresh,signal}):await ndlSeriesQuery({title:q,fresh,signal});
+    const c=out.coverage;
+    canExpand=!!(firstPageOnly&&c&&!c.complete&&!c.stale&&c.total>c.received&&c.received);
+    error=queryIssue(out);
+  }catch(e){ if(isCancelled(e,signal)) throw e; error=e; }
+  if(out.length<3&&!canExpand){ try{ const more=await ndlQuery({any:q,cnt:200,fresh,signal}); error=error||queryIssue(more); out=out.concat(more); }catch(e){ if(isCancelled(e,signal)) throw e; error=e; } }
   checkSignal(signal); lastError=error;
   const k=skey(name), mk=mkey(findTitle(name));
   const cand=out.map(x=>Object.assign({},x,seriesOf(x))).filter(x=>x.vol||x.volumeAmbiguous);
@@ -958,7 +970,7 @@ async function searchSeriesAll(name,fresh,signal){
             label:edLabel(e), count:vols.size,
             unplaced:dedupe(e.items.filter(x=>!x.vol&&x.volumeAmbiguous)),items:[...vols.values()].sort((a,b)=>a.vol-b.vol)};
   }).sort((a,b)=>b.count-a.count);
-  Object.defineProperty(result,'error',{value:error}); return result;
+  Object.defineProperties(result,{error:{value:error},canExpand:{value:canExpand}}); return result;
 }
 /* ══ 外伝・スピンオフ ══
    「オーバーロード」で調べると本編以外に
@@ -1457,7 +1469,14 @@ document.getElementById('main').addEventListener('click',e=>{
   if(e.target.closest('#morecards')){ shelfLimit+=60; render(); return; }
   if(e.target.closest('#exphint')) return exportJSON();
   if(e.target.closest('#newhint')){ openWith('<div class="lab">新刊</div>'); return checkNew(); }
-  const s=e.target.closest('.series'); if(s) return openSeries(s.dataset.g);
+  const s=e.target.closest('.series');
+  if(s){
+    if(e.target.closest('.next,.gap,.fresh.v')){
+      const g=build(books).find(group=>group.key===s.dataset.g);
+      if(g) return volPicker(g,e.target.closest('.next')?null:Number(e.target.textContent));
+    }
+    return openSeries(s.dataset.g);
+  }
   const b=e.target.closest('.book');   if(b) openBook(b.dataset.isbn);
 });
 const sheet=document.getElementById('sheet'), card=document.getElementById('card');
@@ -1736,8 +1755,6 @@ async function spinoffs(g){
     // 棚にあるならその束を開き、無ければ「入れる前の束」に見せかけて巻を選ばせる
     const g2=build(books).find(x=>x.series&&mkey(x.series)===skey(r.title));
     if(g2) return openSeries(g2.key);
-    openWith(`<h2>${esc(r.title)}</h2>
-      <p class="meta">${esc(r.author)}</p><div id="found"></div>`);
     volPicker({series:r.title, author:r.author, edition:'',
                by:new Map(), gaps:[], max:0, key:null});
   });
@@ -1747,35 +1764,61 @@ async function spinoffs(g){
    3巻しか持っていない状態で1・2巻を足す、が最短でできる入口。
    全巻を調べて出し、足りない巻をタップで選ばせる。
    小説と漫画が同居する題名は、版（著者）を選んでから。 */
-async function volPicker(g,pre){
+async function volPicker(g,pre,expand=false,preferredEdition=null){
+  openWith(`<h2>${esc(g.series)}</h2><p class="meta">${esc(g.author)} ${esc(g.edition||'')}</p><div id="found"></div>`);
   const job=viewJob('series'), box=document.getElementById('found');
-  box.innerHTML='<p class="meta" style="padding:12px 0">全巻を調べています…</p>';
+  const sel=new Set(Array.isArray(pre)?pre:pre?[pre]:g.gaps);
+  const known=new Set([...g.gaps,...newOf(g),...sel]);
+  if(g.max<200) known.add(g.max+1);
+  const toggle=(button,v)=>{
+    if(sel.has(v)) sel.delete(v); else sel.add(v);
+    button.classList.toggle('pick',sel.has(v)); button.classList.toggle('can',!sel.has(v));
+    button.setAttribute('aria-pressed',String(sel.has(v)));
+  };
+  const chip=v=>`<button class="v ${sel.has(v)?'pick':'can'}" aria-pressed="${sel.has(v)}" data-vol="${v}">${v}</button>`;
+  box.innerHTML='<div class="lab">巻を選ぶ</div><div class="strip pickgrid">'
+    +[...known].sort((a,b)=>a-b).map(chip).join('')+'</div><p class="meta">書誌を照合中です。先に巻を選べます。</p>';
+  box.onclick=e=>{const btn=e.target.closest('[data-vol]'); if(btn) toggle(btn,+btn.dataset.vol);};
   const tq0=performance.now();
-  let eds=[], issue=null;
-  try{ const found=await searchSeriesAll(g.series,false,job.signal); issue=found.error; eds=found.filter(e=>e.count>=1||(e.unplaced||[]).length); }catch(e){ issue=e; }
+  let eds=[], issue=null, canExpand=false;
+  try{
+    const found=await searchSeriesAll(g.series,false,job.signal,!expand);
+    issue=found.error; canExpand=found.canExpand;
+    eds=found.filter(e=>e.count>=1||(e.unplaced||[]).length);
+  }catch(e){ issue=e; }
   if(!job.current()) return;
   logAct('巻ピッカー',g.series,performance.now()-tq0);
+  const expandButton=canExpand?'<button class="chip" id="vmore">残りの巻を調べる</button>':'';
   if(!eds.length){
-    box.innerHTML=lastError
-      ? `<p class="meta" style="padding:12px 0;color:var(--alert)">${esc(errText(lastError))}。</p>`
+    box.onclick=null;
+    box.innerHTML=issue
+      ? `<p class="meta" style="padding:12px 0;color:var(--alert)">${esc(errText(issue))}。</p>`
       : '<p class="meta" style="padding:12px 0">巻が見つかりませんでした。</p>';
+    if(canExpand) return volPicker(g,[...sel],true,preferredEdition);
     return;
   }
   /* 棚のこの束と同じ版を既定にする。著者だけでなく版元も見る
      （同じ著者名で小説版と漫画版が分かれることがある） */
   const mineKey=akey(g.author)+'|'+pkey(g.edition||'');
-  let cur=eds.find(e=>e.ak+'|'+e.pk===mineKey)
-          ||eds.find(e=>e.ak===akey(g.author))||eds[0];
   const ekey=e=>e.ak+'|'+e.pk;
-  const sel=new Set(pre?[pre]:g.gaps);
+  const ownedISBN=new Set(books.map(b=>b.isbn));
+  const groupISBN=new Set((g.items||[]).map(b=>b.isbn));
+  const matching=eds.filter(e=>e.items.some(b=>groupISBN.has(b.isbn)));
+  const byAuthor=eds.filter(e=>e.ak===akey(g.author));
+  const mine=eds.find(e=>ekey(e)===mineKey)||(matching.length===1?matching[0]:null)
+    ||(!g.edition&&byAuthor.length===1?byAuthor[0]:null);
+  const selectedEdition=preferredEdition?eds.find(e=>ekey(e)===preferredEdition):mine;
+  let cur=selectedEdition||eds[0];
+  if(!selectedEdition) sel.clear();
+  const requested=new Set(sel);
   const draw=()=>{
     const ed=cur;
-    const unplaced=(ed.unplaced||[]).filter(x=>!books.some(b=>b.isbn===x.isbn));
+    const unplaced=(ed.unplaced||[]).filter(x=>!ownedISBN.has(x.isbn));
     /* 「持っている」の判定は版ごとに。小説1〜4巻を持っていても、
        漫画版の1〜4巻はまだ持っていない（両方集める人がいる）。
        版元まで分かれている束では、版元も一致していなければ別の版として扱う。 */
-    const ownEd=g.edition?ekey(ed)===mineKey:ed.ak===akey(g.author);
-    const has=x=>books.some(b=>b.isbn===x.isbn)||(ownEd&&g.by.has(x.vol));
+    const ownEd=mine===ed;
+    const has=x=>ownedISBN.has(x.isbn)||(ownEd&&g.by.has(x.vol));
     const avail=ed.items.filter(x=>!has(x));
     const availSet=new Set(avail.map(x=>x.vol));
     [...sel].forEach(v=>{ if(!availSet.has(v)) sel.delete(v); });
@@ -1792,16 +1835,16 @@ async function volPicker(g,pre){
         const mineB=ownEd?g.by.get(x.vol):null;
         chips+=`<span class="v ${mineB?vcls(mineB):'paper'}">${x.vol}</span>`; return;
       }
-      chips+=`<button class="v ${sel.has(x.vol)?'pick':'can'}" data-vol="${x.vol}">${x.vol}</button>`;
+      chips+=chip(x.vol);
     });
     /* 棚では抜けているのに、この版の記録に無い巻がある。
        他の版なら見つかることがあるので、黙って隠さず伝える。 */
     const edVols=new Set(ed.items.map(x=>x.vol));
-    const nowhere=g.gaps.filter(v=>!edVols.has(v));
+    const nowhere=[...new Set([...g.gaps,...requested])].filter(v=>!edVols.has(v));
     const elsewhere=nowhere.filter(v=>eds.some(e2=>e2!==ed&&e2.items.some(x=>x.vol===v)));
     box.innerHTML=(issue?`<p class="meta" style="color:var(--alert)">${esc(errText(issue))}</p>`:'')
       +`<div class="lab">巻を選ぶ（見つかった${ed.count}巻・持っている巻は金）</div>`
-      +edChips
+      +edChips+expandButton
       +(unplaced.length?`<div class="lab">巻番号を確認できない記録</div><p class="meta">自動的に1巻にしません。書名・ISBNを確認して1冊ずつ登録できます。</p><div id="unplaced">${results(unplaced)}</div>`:'')
       +`<div class="strip pickgrid" style="margin-top:6px">${chips}</div>`
       +(nowhere.length?`<p class="meta" style="margin-top:8px">${
@@ -1820,14 +1863,21 @@ async function volPicker(g,pre){
     box.onclick=async e=>{
       if(e.target.closest('#unplaced')) return;
       const vb=e.target.closest('[data-vol]');
-      if(vb){ const v=+vb.dataset.vol; sel.has(v)?sel.delete(v):sel.add(v); draw(); return; }
+      if(vb){
+        toggle(vb,+vb.dataset.vol);
+        box.querySelector('#vgo').textContent=`選んだ${sel.size}冊を入れる`; return;
+      }
+      if(e.target.closest('#vmore')){
+        const missing=[...requested].filter(v=>!edVols.has(v));
+        return volPicker(g,[...sel,...missing],true,ekey(cur));
+      }
       const ec=e.target.closest('[data-ed]');
-      if(ec){ cur=eds.find(x=>ekey(x)===ec.dataset.ed)||cur; draw(); return; }
+      if(ec){ cur=eds.find(x=>ekey(x)===ec.dataset.ed)||cur; sel.clear(); requested.clear(); draw(); return; }
       const ob=e.target.closest('#vpo [data-v]');
       if(ob){ addOwn=ob.dataset.v; draw(); return; }
       if(e.target.closest('#selgap')){ sel.clear(); g.gaps.forEach(v=>{ if(availSet.has(v)) sel.add(v); }); draw(); return; }
       if(e.target.closest('#selall')){ sel.clear(); avail.forEach(x=>sel.add(x.vol)); draw(); return; }
-      if(e.target.closest('#selnone')){ sel.clear(); draw(); return; }
+      if(e.target.closest('#selnone')){ sel.clear(); requested.clear(); draw(); return; }
       if(e.target.closest('#vgo')){
         if(!sel.size){ toast('巻をタップして選んでください',true); return; }
         const want=avail.filter(x=>sel.has(x.vol));
@@ -2515,7 +2565,7 @@ async function checkNew(force){
       edbox.innerHTML=[...alternatives.values()].map(g=>`<button class="ghost2" data-alt="${esc(g.key)}">${esc(g.series)}：別の版・出版社の巻を確認</button>`).join('');
       edbox.querySelectorAll('[data-alt]').forEach(btn=>btn.onclick=()=>{
         const g=build(books).find(x=>x.key===btn.dataset.alt); if(!g) return;
-        openSeries(g.key); volPicker(g);
+        volPicker(g);
       });
     }
   };
