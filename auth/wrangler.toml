@@ -1,0 +1,10 @@
+name = "nanachi-bookshelf-login"
+main = "worker.mjs"
+compatibility_date = "2025-04-01"
+workers_dev = true
+[[durable_objects.bindings]]
+name = "SHELF"
+class_name = "ShelfSession"
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ShelfSession"]
