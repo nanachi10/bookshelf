@@ -7,7 +7,7 @@
    2. 書誌API（国会図書館・openBD）の応答は絶対にキャッシュしない。
       固定化すると新刊が出てこなくなり、抜け巻検出そのものが嘘になる。 */
 
-const V = 'bookshelf-v5';
+const V = 'bookshelf-v6';
 const SHELL = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 const NEVER = [/ndlsearch\.ndl\.go\.jp/, /api\.openbd\.jp/];        // 触らない
@@ -65,6 +65,8 @@ self.addEventListener('fetch', e => {
   if (req.method !== 'GET') return;                 // 書き込み系は素通し
 
   const url = new URL(req.url);
+  // 共有棚は個人棚のオフラインキャッシュとは独立したページ。
+  if (url.origin === location.origin && url.pathname.startsWith(new URL('share/', self.registration.scope).pathname)) return;
   if (NEVER.some(r => r.test(url.href))) return;    // 書誌APIはそのまま通す
 
   // ページ本体：ネットワーク優先。取れなければ最後に取れた版を出す
