@@ -414,6 +414,23 @@ def main():
             return 'daily refresh skipped duplicate; stored volume 65 selectable offline after reload'
         case('periodic_full_index_survives_reload',periodic_volumes)
 
+        def closed_shelf(page):
+            seed=dict(BASE_BOOK,title='魔男のイチ 9',series='魔男のイチ',vol=9,isbn='9784088851013',author='西修',publisher='集英社')
+            page.evaluate('(b)=>localStorage.setItem("bookshelf:v3",JSON.stringify([b]))',seed)
+            route_url=URL+'releases.json'
+            rows=[['9784088851013','魔男のイチ',9,'西修','集英社','2026.7'],
+                  ['9784088852072','魔男のイチ',10,'西修','集英社','2026.10']]
+            page.route(route_url,lambda r:r.fulfill(json={'through':'2026-11-07','rows':rows}))
+            page.reload()
+            page.wait_for_function('document.querySelector(".ssub")?.textContent.includes("最新10巻")')
+            page.evaluate("()=>{searchSeriesAll=()=>{throw Error('NDL offline')};}")
+            page.click('.series .next')
+            page.click('#found [data-vol="10"]')
+            page.click('#vgo')
+            page.wait_for_function("books.some(b=>b.isbn==='9784088852072'&&b.vol===10)")
+            return 'published index raises shelf latest to 10; correct ISBN added without live series search'
+        case('closed_shelf_release_index',closed_shelf)
+
         def bounded_bulk(page):
             state=page.evaluate('''async()=>{
               let active=0,max=0;searchSeriesAll=async name=>{

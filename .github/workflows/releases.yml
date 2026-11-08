@@ -1,0 +1,22 @@
+name: Refresh public book releases
+on:
+  schedule:
+    - cron: '23 19 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency: public-book-releases
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 tools/releases.py
+      - name: Publish updated records
+        run: |
+          git add releases.json
+          git diff --cached --quiet && exit 0
+          git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com commit -m 'Update public release catalogue'
+          git pull --rebase origin main
+          git push origin HEAD:main

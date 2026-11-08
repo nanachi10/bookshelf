@@ -1302,7 +1302,7 @@ function render(){
         <div class="sbody">
           <div class="stitle">${esc(g.series)}</div>
           <div class="ssub">${g.dup?esc(g.author.split(/[、,\/／]/)[0]
-            +(g.edition?'／'+g.edition:''))+' · ':''}所持${g.have} / 最新${g.max}巻${
+            +(g.edition?'／'+g.edition:''))+' · ':''}所持${g.have} / ${latestLabel(g)}${
             isDone(g)?' · <span class="fin">完結</span>':''}${
             g.buy.length?` · <span class="miss">未所持 ${g.buy.join('、')}</span>`:''}${
             nv.length?` · <span class="fresh">新刊 ${nv.join('、')}</span>`:''}</div>
@@ -1661,7 +1661,7 @@ function openSeries(key){
   openWith(`
     <h2>${esc(g.series)}</h2>
     <p class="meta">${g.dup?esc(g.author.split(/[、,\/／]/)[0]
-      +(g.edition?'／'+g.edition:''))+' · ':''}所持${g.have}冊 · 最新${g.max}巻${
+      +(g.edition?'／'+g.edition:''))+' · ':''}所持${g.have}冊 · ${latestLabel(g)}${
       g.buy.length?` · 未所持 ${g.buy.join('、')}`:''}</p>
     <div class="covers" style="margin-top:12px">${covers}</div>
     ${g.unplaced.length?`<div class="lab">巻番号未確定の本</div><p class="meta">巻順には入れていません。書名・ISBNを確認できます。</p>
@@ -1766,14 +1766,62 @@ async function spinoffs(g){
    小説と漫画が同居する題名は、版（著者）を選んでから。 */
 const volumeDay=86400000, volumeRetry=new Map();
 const volumeKey=name=>new URL('./__volumes_v'+QVER+'/'+encodeURIComponent(name),location.href).href;
+const catalogue=new Map(), volumeMemory=new Map();
+let releaseReady=Promise.resolve(), releaseThrough='';
+function installReleases(data){
+  if(!Array.isArray(data?.rows))return false;
+  if(releaseThrough && (!data.through||data.through<releaseThrough))return false;
+  releaseThrough=data.through||'';
+  catalogue.clear();
+  for(const [isbn,series,vol,author,publisher,date] of data.rows){
+    if(!isISBN13(isbn)||!Number.isInteger(vol)||vol<1||vol>200)continue;
+    const k=skey(series); if(!catalogue.has(k))catalogue.set(k,[]);
+    catalogue.get(k).push({isbn,series,vol,author,publisher,date:ym(date),title:series+' '+vol,src:'国会図書館'});
+  }
+  return true;
+}
+async function loadReleases(){
+  let cache;
+  try{cache=await caches.open('bookshelf-releases');const r=await cache.match('./releases.json');
+    if(r&&installReleases(await r.json()))render();}catch(e){}
+  const live='https://raw.githubusercontent.com/nanachi10/bookshelf/main/releases.json';
+  for(const url of (location.hostname==='nanachi10.github.io'?[live,'./releases.json']:['./releases.json'])){
+    try{const res=await fetch(url,{cache:'no-cache',signal:AbortSignal.timeout(6000)});
+      if(!res.ok)continue;
+      const data=await res.json();
+      if(!installReleases(data))continue;
+      render(); if(cache)await cache.put('./releases.json',new Response(JSON.stringify(data)));break;
+    }catch(e){}
+  }
+}
+function releaseBooks(g){
+  if(!g.isSeries)return [];
+  const all=catalogue.get(skey(g.series))||[];
+  const authors=new Set(g.items.map(b=>akey(b.author)).filter(Boolean));
+  const publishers=new Set(g.items.map(b=>pkey(b.publisher)).filter(Boolean));
+  const own=new Set(g.items.map(b=>b.isbn));
+  const anchors=new Set(all.filter(b=>own.has(b.isbn)).map(b=>akey(b.author)+'|'+pkey(b.publisher)));
+  return all.filter(b=>anchors.has(akey(b.author)+'|'+pkey(b.publisher))||
+    authors.has(akey(b.author))&&publishers.has(pkey(b.publisher)));
+}
+function cachedBooks(g){
+  const eds=volumeMemory.get(g.series)?.eds||[], own=new Set(g.items.map(b=>b.isbn));
+  const matching=eds.filter(e=>e.items.some(b=>own.has(b.isbn)));
+  return matching.length===1?matching[0].items:[];
+}
+function latestLabel(g){
+  const vols=[...releaseBooks(g),...cachedBooks(g)].map(b=>b.vol).concat(seriesMeta(g)?.newVols||[]);
+  return (vols.length?'最新':'登録最大')+Math.max(g.max,...vols)+'巻';
+}
 async function readVolumes(name){
   try{const hit=await (await caches.open('volume-index')).match(volumeKey(name));
-    if(hit){const row=await hit.json();if(Array.isArray(row.eds))return row;}
+    if(hit){const row=await hit.json();if(Array.isArray(row.eds)){volumeMemory.set(name,row);return row;}}
   }catch(e){}
   return null;
 }
 async function saveVolumes(name,eds){
   if(eds.error||eds.canExpand||!eds.length)return;
+  volumeMemory.set(name,{at:Date.now(),eds});
   try{await (await caches.open('volume-index')).put(volumeKey(name),
     new Response(JSON.stringify({at:Date.now(),eds})));
   }catch(e){}
@@ -1817,7 +1865,19 @@ async function volPicker(g,pre,expand=false,preferredEdition=null){
   try{
     const saved=await readVolumes(g.series);
     if(!job.current())return;
-    const found=saved&&!expand?saved.eds:await searchSeriesAll(g.series,false,job.signal);
+    if(navigator.onLine&&(!releaseThrough||Date.now()-Date.parse(releaseThrough)>2*volumeDay))await releaseReady;
+    if(!job.current())return;
+    const published=releaseBooks(g);
+    let found;
+    if(published.length&&!expand){
+      const merged=new Map([...g.items,...cachedBooks(g),...published].filter(b=>b.vol).map(b=>[b.vol,b]));
+      found=[{ak:akey(g.author),pk:pkey(g.edition||''),label:g.author,items:[...merged.values()].sort((a,b)=>a.vol-b.vol),count:merged.size}];
+      found.canExpand=true;
+    }else found=saved&&!expand?saved.eds:await searchSeriesAll(g.series,false,job.signal);
+    if(published.length&&expand&&found.length){
+      const target=found.find(e=>e.items.some(b=>g.items.some(x=>x.isbn===b.isbn)));
+      if(target){const m=new Map([...published,...target.items].map(b=>[b.vol,b]));target.items=[...m.values()].sort((a,b)=>a.vol-b.vol);target.count=m.size;}
+    }
     if(!saved||expand)await saveVolumes(g.series,found);
     if(saved&&!expand&&Date.now()-saved.at>=volumeDay)
       issue=Object.assign(new Error('前回取得した巻を表示しています（'+new Date(saved.at).toLocaleDateString('ja-JP')+'）'),{name:'PartialResultsError'});
@@ -1826,7 +1886,7 @@ async function volPicker(g,pre,expand=false,preferredEdition=null){
   }catch(e){ issue=e; }
   if(!job.current()) return;
   logAct('巻ピッカー',g.series,performance.now()-tq0);
-  const expandButton=canExpand?'<button class="chip" id="vmore">残りの巻を調べる</button>':'';
+  const expandButton=canExpand?'<button class="chip" id="vmore">ほかの巻・版も調べる</button>':'';
   if(!eds.length){
     box.onclick=null;
     box.innerHTML=issue
@@ -1882,7 +1942,7 @@ async function volPicker(g,pre,expand=false,preferredEdition=null){
     const elsewhere=nowhere.filter(v=>eds.some(e2=>e2!==ed&&e2.items.some(x=>x.vol===v)));
     box.innerHTML=(issue?`<p class="meta" style="color:var(--alert)">${esc(errText(issue))}</p>`:'')
       +`<div class="lab">巻を選ぶ（見つかった${ed.count}巻・持っている巻は金）</div>`
-      +'<p class="meta">本棚を開いている間に、連載中の作品の巻一覧を1日ごとに更新します。</p>'
+      +'<p class="meta">新刊の公開書誌は、本棚を閉じていても毎日更新します。</p>'
       +edChips+expandButton
       +(unplaced.length?`<div class="lab">巻番号を確認できない記録</div><p class="meta">自動的に1巻にしません。書名・ISBNを確認して1冊ずつ登録できます。</p><div id="unplaced">${results(unplaced)}</div>`:'')
       +`<div class="strip pickgrid" style="margin-top:6px">${chips}</div>`
@@ -2253,7 +2313,7 @@ function saveMeta(){
 }
 const seriesMeta=g=>{ const m=meta.series[gkey(g)]; return (m&&typeof m==='object')?m:null; };
 // 前回調べたときに見つかっていた新刊。棚に入れたぶんは落とす
-const newOf=g=>((seriesMeta(g)||{}).newVols||[]).filter(v=>!g.by.has(v));
+const newOf=g=>[...new Set([...(seriesMeta(g)?.newVols||[]),...[...releaseBooks(g),...cachedBooks(g)].map(b=>b.vol).filter(v=>v>g.max)])].filter(v=>!g.by.has(v)).sort((a,b)=>a-b);
 /* ══ 操作の記録 ══
    何をいつ追加・削除・検索したかを端末の中だけに残す。
    不具合の再現手順を思い出せるように、また「よく使う流れ」を
@@ -3214,7 +3274,7 @@ function openTidy(){
         <div class="n">${esc(g.series||g.items[0].title)}${
           g.edition?`<em class="alt">${esc(g.edition.slice(0,10))}</em>`:''}
           <small>${esc((g.author||'').split(/[、,\/／]/)[0])}${
-            g.isSeries?` / ${g.items.length}冊（最新${g.max}巻）`:` / ${g.items.length}冊`}</small></div>
+            g.isSeries?` / ${g.items.length}冊（${latestLabel(g)}）`:` / ${g.items.length}冊`}</small></div>
         </button>`;
     };
     const series=gs.filter(g=>g.isSeries), singles=gs.filter(g=>!g.isSeries);
@@ -3648,6 +3708,13 @@ function toast(msg,warn,action){
   render();
   if(migrate) await stateJob(()=>save(books));
   if(!store.bad){
+    let lastReleaseLoad=0;
+    const syncReleases=()=>{if(!document.hidden&&Date.now()-lastReleaseLoad>300000){
+      lastReleaseLoad=Date.now();releaseReady=loadReleases();
+    }};
+    syncReleases();document.addEventListener('visibilitychange',syncReleases);
+    window.addEventListener('pageshow',syncReleases);
+    Promise.all([...new Set(build(books).filter(g=>g.isSeries).map(g=>g.series))].map(readVolumes)).then(()=>{if(volumeMemory.size)render();});
     setTimeout(refreshVolumes,10000);
     setInterval(refreshVolumes,3600000);
     document.addEventListener('visibilitychange',refreshVolumes);
