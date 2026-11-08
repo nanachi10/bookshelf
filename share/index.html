@@ -2,11 +2,47 @@
 <html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="referrer" content="no-referrer"><title>共有の本棚</title>
 <style>
 *{box-sizing:border-box}body{margin:0;background:#f7f4ed;color:#312c24;font:16px/1.6 system-ui,sans-serif}main{max-width:1200px;margin:auto;padding:24px}header{border-bottom:2px solid #a78967;margin-bottom:20px}h1{font: bold 32px serif;margin:0}input{width:min(100%,440px);font:inherit;padding:8px 12px;border:1px solid #968875;border-radius:6px}ul{list-style:none;padding:0;display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:24px 14px}li{min-width:0;font-size:14px}li div{aspect-ratio:2/3;background:#e9e2d3;display:grid;place-items:center;color:#79694e}img{width:100%;height:100%;object-fit:contain;min-height:0}strong,small{display:block;overflow-wrap:anywhere}strong{margin-top:6px}
+.lettercover{background:#ece5d4;border-left:5px solid #8f7258;text-align:center;padding:12px;font:600 16px/1.5 serif;overflow:hidden;overflow-wrap:anywhere}
 </style><main><header><h1>共有の本棚</h1><p id="count" role="status">読み込み中…</p></header><input id="query" type="search" aria-label="書名・著者で検索" placeholder="書名・著者で検索" hidden><ul id="shelf"></ul></main>
 <script type="module">
 const count = document.querySelector('#count');
 const query = document.querySelector('#query');
 const shelf = document.querySelector('#shelf');
+function showCover(box, book) {
+  const sources = new Set();
+  if (book.cover?.startsWith('https://')) sources.add(book.cover);
+  const isbn = book.isbn || '';
+  if (/^97[89]\d{10}$/.test(isbn)) {
+    sources.add('https://thumbnail.image.rakuten.co.jp/@0_mall/book/cabinet/' + isbn.slice(-4) + '/' + isbn + '.jpg');
+    if (isbn.startsWith('978')) {
+      const digits = isbn.slice(3,12);
+      const sum = [...digits].reduce((total,n,i) => total + Number(n)*(10-i), 0);
+      const check = (11-sum%11)%11;
+      sources.add('https://images-na.ssl-images-amazon.com/images/P/' + digits + (check===10?'X':check) + '.09.LZZZZZZZ.jpg');
+    }
+    sources.add('https://cover.openbd.jp/' + isbn + '.jpg');
+    sources.add('https://books.google.com/books/content?vid=ISBN' + isbn + '&printsec=frontcover&img=1&zoom=1');
+  }
+  const candidates = sources.values();
+  const img = new Image();
+  img.alt = '';
+  img.loading = 'lazy';
+  function next() {
+    const url = candidates.next().value;
+    if (url) {
+      img.src = url;
+      if (!img.parentNode) box.replaceChildren(img);
+    } else {
+      box.className = 'lettercover';
+      box.textContent = book.title;
+    }
+  }
+  img.onerror = next;
+  img.onload = () => {
+    if (img.naturalWidth <= 1 || (img.src.startsWith('https://books.google.com/') && img.naturalWidth === 128 && img.naturalHeight === 170)) next();
+  };
+  next();
+}
 function render(books) {
   const needle = query.value.trim().normalize('NFKC').toLowerCase();
   const matches = books.filter(book => (book.title + ' ' + book.author).normalize('NFKC').toLowerCase().includes(needle));
@@ -14,15 +50,7 @@ function render(books) {
   const items = matches.map(book => {
     const item = document.createElement('li');
     const cover = document.createElement('div');
-    cover.textContent = '表紙なし';
-    if (book.cover?.startsWith('https://')) {
-      const img = new Image();
-      img.loading = 'lazy';
-      img.alt = '';
-      img.onerror = () => { cover.textContent = '表紙なし'; };
-      img.src = book.cover;
-      cover.replaceChildren(img);
-    }
+    showCover(cover, book);
     const title = document.createElement('strong');
     title.textContent = book.title;
     const author = document.createElement('small');
@@ -32,14 +60,25 @@ function render(books) {
   });
   shelf.replaceChildren(...items);
 }
-try {
+async function loadSnapshot() {
   const rawKey = Uint8Array.from(atob(location.hash.slice(1).replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0));
   const key = await crypto.subtle.importKey('raw', rawKey, 'AES-GCM', false, ['decrypt']);
   const response = await fetch('./shelf.bin');
   if (!response.ok) throw Error();
   const bytes = new Uint8Array(await response.arrayBuffer());
   const data = await crypto.subtle.decrypt({name:'AES-GCM',iv:bytes.slice(0,12)},key,bytes.slice(12));
-  const books = JSON.parse(new TextDecoder().decode(data));
+  return JSON.parse(new TextDecoder().decode(data));
+}
+async function readLink() {
+  if (!location.hash.startsWith('#v1.')) return loadSnapshot();
+  const packed = Uint8Array.from(atob(location.hash.slice(4).replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0));
+  const stream = new Blob([packed]).stream().pipeThrough(new DecompressionStream('gzip'));
+  const rows = await new Response(stream).json();
+  return rows.map(([title,author,isbn,cover]) => ({title,author,isbn,cover}));
+}
+window.addEventListener('hashchange', () => location.reload());
+try {
+  const books = await readLink();
   render(books);
   query.hidden = false;
   query.oninput = () => render(books);

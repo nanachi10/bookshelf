@@ -287,7 +287,7 @@ main.still .series,main.still .book{animation:none}
 
 <header>
   <div class="brand"><h1>本棚</h1><span class="stat" id="stat"></span>
-    <button class="sortbtn" id="sortbtn"></button></div>
+    <button class="sortbtn" id="sortbtn"></button><button class="sortbtn" style="margin-left:8px" id="shareShelf">共有</button></div>
   <input class="search" id="q" type="search" placeholder="棚の中を絞り込む（タイトル・著者・場所）"
     aria-label="棚の中を絞り込む" autocomplete="off">
   <div class="chips" id="chips"></div>
@@ -1447,6 +1447,55 @@ const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;'
 // 圏外に出た／戻ったら、その場で表示を切り替える
 addEventListener('online',()=>render());
 addEventListener('offline',()=>render());
+function shareBase64(bytes){
+  let binary='';
+  for(const byte of new Uint8Array(bytes)) binary+=String.fromCharCode(byte);
+  return btoa(binary).replaceAll('+','-').replaceAll('/','_').replace(/=+$/,'');
+}
+async function shareFragment(rows){
+  // The original short link can be recovered only with the matching catalog.
+  const identity=JSON.stringify(rows.map(row=>row.slice(0,3)));
+  const hash=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(identity));
+  try{
+    const response=await fetch(new URL('share/reference.bin',location.href),{signal:AbortSignal.timeout(3000)});
+    if(response.ok){
+      const wrapped=new Uint8Array(await response.arrayBuffer());
+      const key=await crypto.subtle.importKey('raw',hash,'AES-GCM',false,['decrypt']);
+      const original=await crypto.subtle.decrypt({name:'AES-GCM',iv:wrapped.slice(0,12)},key,wrapped.slice(12));
+      return shareBase64(original);
+    }
+  }catch{ /* A different shelf or an offline browser can use a self-contained link. */ }
+  const raw=new Blob([JSON.stringify(rows)]);
+  const packed=await new Response(raw.stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer();
+  return 'v1.'+shareBase64(packed);
+}
+document.getElementById('shareShelf').onclick=async()=>{
+  if(!books.length) return toast('共有する本がまだありません');
+  // 標準の書影URLはISBNから閲覧側で再現できる。
+  const rows=books.map(b=>{
+    const row=[b.title,b.author||'',/^97[89]\d{10}$/.test(b.isbn)?b.isbn:''];
+    if(/^https:\/\//.test(b.cover)&&![aCover(b.isbn),rakutenCover(b.isbn),gCover(b.isbn)].includes(b.cover)) row.push(b.cover);
+    return row;
+  });
+  try{
+    const link=new URL('share/',location.href);
+    link.hash=await shareFragment(rows);
+    openWith('<h2>本棚を共有</h2><p>'+rows.length+'冊の書名・著者・表紙を閲覧できるリンクです。本を追加したら、新しいリンクを発行してください。</p><input id="shareUrl" readonly aria-label="共有リンク"><div class="menu"><button id="copyShelf">リンクをコピー</button><button id="sendShelf">共有先を選ぶ</button></div>');
+    const field=document.getElementById('shareUrl');
+    field.value=link.href;
+    field.onclick=()=>field.select();
+    document.getElementById('copyShelf').onclick=async()=>{
+      try{await navigator.clipboard.writeText(link.href);toast('リンクをコピーしました');}
+      catch{field.focus();field.select();toast('選択したリンクをコピーしてください');}
+    };
+    const send=document.getElementById('sendShelf');
+    send.hidden=!navigator.share;
+    send.onclick=async()=>{
+      try{await navigator.share({title:'共有の本棚',url:link.href});}
+      catch(err){if(err.name!=='AbortError') toast('リンクをコピーして共有してください');}
+    };
+  }catch{toast('リンクを作成できませんでした。最新版のブラウザでお試しください');}
+};
 document.getElementById('sortbtn').onclick=()=>{
   openWith(`<h2>並び替え</h2>
     <p class="meta">同じ項目をもう一度選ぶと逆順になります。</p>
