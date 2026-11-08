@@ -377,28 +377,42 @@ def main():
         def pick_while_loading(page):
             page.evaluate("""()=>{window.partitions=0;
                 const rows=[1,2,3].map(vol=>({...books[0],isbn:vol===1?books[0].isbn:'Mvol'+vol,title:'Fixture '+vol,vol}));
-                ndlQuery=({cnt})=>new Promise(resolve=>{window.firstCount=cnt;window.release=()=>resolve(Object.assign(rows,{
-                    coverage:{complete:false,total:90,received:50}}));});
-                ndlSeriesQuery=async()=>{window.partitions++;return rows;};
+                ndlSeriesQuery=()=>new Promise(resolve=>{window.partitions++;window.release=()=>resolve(rows);});
             }""")
             page.click('.series .next')
             page.click('#found [data-vol="2"]')
             assert page.locator('#vgo').count()==0
             page.evaluate('release()')
             assert '1冊' in page.locator('#vgo').inner_text()
-            assert page.evaluate('[firstCount,partitions]')==[50,0]
+            assert page.evaluate('partitions')==1
             chip=page.locator('#found [data-vol="3"]')
             chip.evaluate('(el)=>{window.originalChip=el}')
             chip.click()
             assert chip.evaluate('(el)=>el===window.originalChip')
-            page.click('#vmore')
+            assert page.locator('#vmore').count()==0
             assert page.evaluate('partitions')==1
             assert '2冊' in page.locator('#vgo').inner_text()
             page.click('#vgo')
             page.reload()
             page.wait_for_function('books.length===3')
-            return 'selected before the first response, kept choices through expansion, saved and reopened'
-        case('volume_selection_before_network_and_after_expansion',pick_while_loading)
+            return 'selected before the first response, kept choices through full lookup, saved and reopened'
+        case('volume_selection_before_full_response',pick_while_loading)
+
+        def periodic_volumes(page):
+            page.evaluate("""async()=>{window.calls=0;
+              searchSeriesAll=async(name,fresh)=>{if(!fresh)throw Error('expected fresh');
+                window.calls++; return [{ak:akey(books[0].author),pk:pkey(books[0].publisher),count:2,
+                items:[books[0],{...books[0],isbn:'Mlatest',vol:65}]}];};
+              await refreshVolumes();await refreshVolumes();}""")
+            assert page.evaluate('calls')==1
+            page.reload()
+            page.evaluate("()=>{searchSeriesAll=()=>{throw Error('offline')};}")
+            page.click('.series .next')
+            page.click('#found [data-vol="65"]')
+            page.click('#vgo')
+            page.wait_for_function("books.some(b=>b.isbn==='Mlatest'&&b.vol===65)")
+            return 'daily refresh skipped duplicate; stored volume 65 selectable offline after reload'
+        case('periodic_full_index_survives_reload',periodic_volumes)
 
         def bounded_bulk(page):
             state=page.evaluate('''async()=>{

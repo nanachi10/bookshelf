@@ -1764,6 +1764,39 @@ async function spinoffs(g){
    3巻しか持っていない状態で1・2巻を足す、が最短でできる入口。
    全巻を調べて出し、足りない巻をタップで選ばせる。
    小説と漫画が同居する題名は、版（著者）を選んでから。 */
+const volumeDay=86400000, volumeRetry=new Map();
+const volumeKey=name=>new URL('./__volumes_v'+QVER+'/'+encodeURIComponent(name),location.href).href;
+async function readVolumes(name){
+  try{const hit=await (await caches.open('volume-index')).match(volumeKey(name));
+    if(hit){const row=await hit.json();if(Array.isArray(row.eds))return row;}
+  }catch(e){}
+  return null;
+}
+async function saveVolumes(name,eds){
+  if(eds.error||eds.canExpand||!eds.length)return;
+  try{await (await caches.open('volume-index')).put(volumeKey(name),
+    new Response(JSON.stringify({at:Date.now(),eds})));
+  }catch(e){}
+}
+let refreshingVolumes=false;
+async function refreshVolumes(){
+  if(refreshingVolumes||document.hidden||!navigator.onLine)return;
+  refreshingVolumes=true;
+  try{
+    const names=new Set(build(books).filter(g=>g.isSeries&&!isDone(g)).map(g=>g.series));
+    for(const name of [...names].sort((a,b)=>(volumeRetry.get(a)||0)-(volumeRetry.get(b)||0))){
+      if(document.hidden||!navigator.onLine)break;
+      if(Date.now()<(volumeRetry.get(name)||0))continue;
+      const saved=await readVolumes(name);
+      if(saved&&Date.now()-saved.at<volumeDay)continue;
+      volumeRetry.set(name,Date.now()+3600000);
+      const eds=await searchSeriesAll(name,true);
+      if(eds.error&&!['UnresolvedVolumesError','SeriesMismatchError','PartialResultsError'].includes(eds.error.name))break;
+      await saveVolumes(name,eds);
+      await waitRequest(1200);
+    }
+  }catch(e){}finally{refreshingVolumes=false;}
+}
 async function volPicker(g,pre,expand=false,preferredEdition=null){
   openWith(`<h2>${esc(g.series)}</h2><p class="meta">${esc(g.author)} ${esc(g.edition||'')}</p><div id="found"></div>`);
   const job=viewJob('series'), box=document.getElementById('found');
@@ -1782,8 +1815,13 @@ async function volPicker(g,pre,expand=false,preferredEdition=null){
   const tq0=performance.now();
   let eds=[], issue=null, canExpand=false;
   try{
-    const found=await searchSeriesAll(g.series,false,job.signal,!expand);
-    issue=found.error; canExpand=found.canExpand;
+    const saved=await readVolumes(g.series);
+    if(!job.current())return;
+    const found=saved&&!expand?saved.eds:await searchSeriesAll(g.series,false,job.signal);
+    if(!saved||expand)await saveVolumes(g.series,found);
+    if(saved&&!expand&&Date.now()-saved.at>=volumeDay)
+      issue=Object.assign(new Error('前回取得した巻を表示しています（'+new Date(saved.at).toLocaleDateString('ja-JP')+'）'),{name:'PartialResultsError'});
+    issue=found.error||issue; canExpand=found.canExpand;
     eds=found.filter(e=>e.count>=1||(e.unplaced||[]).length);
   }catch(e){ issue=e; }
   if(!job.current()) return;
@@ -1844,6 +1882,7 @@ async function volPicker(g,pre,expand=false,preferredEdition=null){
     const elsewhere=nowhere.filter(v=>eds.some(e2=>e2!==ed&&e2.items.some(x=>x.vol===v)));
     box.innerHTML=(issue?`<p class="meta" style="color:var(--alert)">${esc(errText(issue))}</p>`:'')
       +`<div class="lab">巻を選ぶ（見つかった${ed.count}巻・持っている巻は金）</div>`
+      +'<p class="meta">本棚を開いている間に、連載中の作品の巻一覧を1日ごとに更新します。</p>'
       +edChips+expandButton
       +(unplaced.length?`<div class="lab">巻番号を確認できない記録</div><p class="meta">自動的に1巻にしません。書名・ISBNを確認して1冊ずつ登録できます。</p><div id="unplaced">${results(unplaced)}</div>`:'')
       +`<div class="strip pickgrid" style="margin-top:6px">${chips}</div>`
@@ -3488,8 +3527,7 @@ function showShelfSync(plan){
    前回から離れたときだけ静かに促す。データを自動送信することはしない。 */
 /* ══ 新刊確認の促し ══
    続きが出ていても、こちらから調べに行かないと分からない。
-   自動では通信しない（勝手に外へ繋ぐのは気持ちが悪いし、
-   国会図書館にも迷惑）。代わりに、間があいたときだけ静かに誘う。 */
+   ＋の巻一覧とは別に、新刊一覧の手動確認を案内する。 */
 function newHint(){
   const gs=build(books).filter(g=>g.isSeries&&!isDone(g));
   if(!gs.length) return '';
@@ -3500,7 +3538,7 @@ function newHint(){
   return `<button class="hint" id="newhint">${
     meta.newAt?`${stale.length}作品は、2週間以上あたらしい巻を調べていません`
               :`続きが出ていないか、まだ調べていません（${stale.length}作品）`
-    }。確かめませんか</button>`;
+    }。新刊を確認する</button>`;
 }
 function exportHint(){
   if(!books.length) return '';
@@ -3609,6 +3647,12 @@ function toast(msg,warn,action){
   const migrate=!store.bad&&!recovery&&(fromPrev||JSON.stringify(books)!==before);
   render();
   if(migrate) await stateJob(()=>save(books));
+  if(!store.bad){
+    setTimeout(refreshVolumes,10000);
+    setInterval(refreshVolumes,3600000);
+    document.addEventListener('visibilitychange',refreshVolumes);
+    window.addEventListener('online',refreshVolumes);
+  }
   logAct('起動',`${books.length}冊`,performance.now()-T0);
 })();
 </script>
