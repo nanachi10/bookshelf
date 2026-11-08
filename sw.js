@@ -12,6 +12,7 @@ const SHELL = ['./', './index.html', './manifest.json', './icon-192.png', './ico
 
 const NEVER = [/ndlsearch\.ndl\.go\.jp/, /api\.openbd\.jp/];        // 触らない
 const COVERS= [/images-na\.ssl-images-amazon\.com/,                 // 表紙は貯めてよい
+               /^https:\/\/thumbnail\.image\.rakuten\.co\.jp\/@0_mall\/book\/cabinet\//,
                /books\.google\.com/];
 const KEEP  = [...COVERS,
                /fonts\.googleapis\.com/, /fonts\.gstatic\.com/];

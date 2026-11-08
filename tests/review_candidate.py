@@ -425,6 +425,48 @@ def main():
             return 'image success does not mutate shelf before its deferred save; quota failure preserves old cover'
         case('image_onload_deferred_save_failure_preserves_books',cover_image_failure)
 
+        def demi_search(page):
+            state=page.evaluate('''async()=>{
+              const series='亜人ちゃんは語りたい', ruby='亜人(デミ)ちゃんは語りたい';
+              const catalog=[
+                {isbn:'9784063826692',series,title:series+' 2',vol:2,author:'ペトス'},
+                {isbn:'9784063827576',series,title:ruby+' 3',vol:3,author:'ペトス'},
+                {isbn:'9784758009508',series:ruby+'コミックアンソロジーガシガシ',
+                 title:ruby+'コミックアンソロジーガシガシ 2',vol:2,author:'別著者'}];
+              let calls=0;
+              ndlFetch=async()=>{calls++;const items=catalog.slice();
+                items.coverage={complete:true,received:3,total:3};return items;};
+              await ndlQuery({title:'亜人ちゃん',cnt:25});
+              await ndlQuery({title:'亜人ちゃん',cnt:200});
+              const afterComplete=calls;
+              qcache.clear();const partial=await ndlQuery({title:'亜人ちゃん',cnt:25});
+              partial.coverage.complete=false;
+              await ndlQuery({title:'亜人ちゃん',cnt:200});
+              const afterPartial=calls;
+              const eds=await searchSeriesAll('亜人ちゃん');
+              return {afterComplete,afterPartial,volumes:eds[0].items.map(b=>b.vol),
+                oldBook:searchText({title:ruby+' 3',series:ruby}).includes('亜人ちゃん')};
+            }''')
+            assert state==dict(afterComplete=1,afterPartial=3,volumes=[2,3],oldBook=True),state
+            return state
+        case('demi_short_title_and_complete_suggestions',demi_search)
+
+        def cover_fallback(page):
+            state=page.evaluate('''()=>{
+              const b={isbn:'9784063827576',title:'亜人ちゃんは語りたい 3'};
+              const el=document.createElement('img');
+              const urls=coverSrcs(b);el.src=urls[0];el.dataset.p='1';el.dataset.b=b.isbn;
+              el.dataset.n=urls.slice(1).map(encodeURIComponent).join(' ');nextCover(el);
+              Object.defineProperty(el,'naturalWidth',{value:128});
+              Object.defineProperty(el,'naturalHeight',{value:170});
+              ckCover(el);
+              return {src:el.src,preferred:coverSrcs(b)[0],pending:coverUpdates.has(b.isbn)};
+            }''')
+            expected='https://thumbnail.image.rakuten.co.jp/@0_mall/book/cabinet/7576/9784063827576.jpg'
+            assert state==dict(src=expected,preferred=expected,pending=False),state
+            return state
+        case('search_cover_fallback_is_reused_without_saving',cover_fallback)
+
         def paging(page):
             state=page.evaluate('''()=>{
               books=Array.from({length:2000},(_,i)=>normalize({isbn:'M'+i,title:'Single '+i+'x',own:'paper'}));

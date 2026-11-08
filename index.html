@@ -508,8 +508,10 @@ const mainTitle=s=>norm(s)
   .replace(/^亜人\s*[（(]\s*デミ\s*[)）]\s*/,'亜人')
   .replace(/^電波教師\s*:\s*HE IS A ULTIMATE TEACHER\s*$/i,'電波教師');
 const mkey=s=>skey(mainTitle(s));
+// 入力用の略称。書誌の題名や、アンソロジーなど別作品の見出しには適用しない。
+const findTitle=s=>mkey(s)==='亜人ちゃん'?'亜人ちゃんは語りたい':mainTitle(s);
 // NDLでは短編集・Ex・章が題名ではなく巻表示に入る。取得は本題、採用はシリーズ完全一致。
-const seriesQuery=s=>mainTitle(s).replace(/\s+(短編集|Ex|第\d+章(?:\s*[（(].*[)）])?)$/i,'');
+const seriesQuery=s=>findTitle(s).replace(/\s+(短編集|Ex|第\d+章(?:\s*[（(].*[)）])?)$/i,'');
 function parseSeries(raw){
   let t=norm(raw);
   const family=t.match(/^(.+?)\s*(短編集|Ex)\s*(\d{1,3})(?:\s*[（(].*[)）])?$/i);
@@ -744,6 +746,12 @@ async function ndlQuery(p){
     if(dk&&dk.v===QVER&&Date.now()-dk.t<(p.isbn?2592000000:21600000)){
       const items=dk.items.slice(); items.coverage=dk.coverage; return items;
     }
+    // 同じ題名で候補表示が既に全件受信していれば、検索・巻選択で取り直さない。
+    if(p.title&&(p.cnt||200)>25){
+      const suggestion=qcache.get(u.replace(/&cnt=\d+&/,'&cnt=25&'));
+      if(suggestion&&Date.now()-suggestion.t<600000&&suggestion.items?.coverage?.complete&&suggestion.items.length)
+        return suggestion.items;
+    }
   }
   const entry={t:Date.now()};
   const job=ndlFetch(u,p.signal).then(items=>{
@@ -755,7 +763,7 @@ async function ndlQuery(p){
        「見つかりませんでした」が6時間固定されてしまう。
        打鍵ごとのサジェスト（cnt=25）も残さない——数が多く、
        古い順の間引きで肝心の全巻リスト（cnt=500）を押し流す。 */
-    if(items.length&&!queryIssue(items)&&(p.cnt||200)>=200){ qd[u]={v:QVER,t:Date.now(),items,coverage:items.coverage}; qsave(); }
+    if(items.length&&!queryIssue(items)&&(p.isbn||(p.cnt||200)>=200)){ qd[u]={v:QVER,t:Date.now(),items,coverage:items.coverage}; qsave(); }
     return items;
   });
   entry.p=job; qcache.set(u,entry);
@@ -921,7 +929,7 @@ async function searchSeriesAll(name,fresh,signal){
   try{ out=await ndlSeriesQuery({title:q,fresh,signal}); error=queryIssue(out); }catch(e){ if(isCancelled(e,signal)) throw e; error=e; }
   if(out.length<3){ try{ const more=await ndlQuery({any:q,cnt:200,fresh,signal}); error=error||queryIssue(more); out=out.concat(more); }catch(e){ if(isCancelled(e,signal)) throw e; error=e; } }
   checkSignal(signal); lastError=error;
-  const k=skey(name), mk=mkey(name);
+  const k=skey(name), mk=mkey(findTitle(name));
   const cand=out.map(x=>Object.assign({},x,seriesOf(x))).filter(x=>x.vol||x.volumeAmbiguous);
   // 原題（OVERLORD 等）で探されたときも、日本語見出しの束に正しく集める
   const exact=cand.filter(x=>skey(x.series)===k||mkey(x.series)===mk
@@ -1205,7 +1213,10 @@ let rendered=false, shelfLimit=60;
 const bookSearch=new WeakMap();
 function searchText(b){
   let text=bookSearch.get(b);
-  if(text===undefined){ text=norm(b.title+' '+b.author+' '+b.publisher+' '+(b.series||'')+' '+(b.place||'')+' '+(b.note||'')).toLowerCase(); bookSearch.set(b,text); }
+  if(text===undefined){
+    text=norm([b.title,b.series,mainTitle(b.title),mainTitle(b.series),b.author,b.publisher,b.place,b.note].join(' ')).toLowerCase();
+    bookSearch.set(b,text);
+  }
   return text;
 }
 function render(){
@@ -1336,8 +1347,8 @@ function pin(b){
   if(b.anime)           return '<span class="pin anime"></span>';
   return '';
 }
-/* ══ 書影は3段構え ══
-   Amazon（和書の網羅率が最も高く、353x500 と解像度も上）→ Google → 題名の文字。
+/* ══ 書影の候補 ══
+   保存済みの表紙に続いて Amazon、楽天ブックス、Google の順に試す。
    国会図書館の書影は Referer を自ドメインに限っていて他所からは403なので使えない。
 
    厄介なのは「表紙が無い」ときの返し方が業者ごとに違うこと。
@@ -1355,10 +1366,12 @@ const aCover=isbn=>{ const t=isbn10from13(isbn);
   return t?`https://images-na.ssl-images-amazon.com/images/P/${t}.09.LZZZZZZZ.jpg`:''; };
 const gCover=isbn=>/^\d{13}$/.test(isbn||'')
   ? `https://books.google.com/books/content?vid=ISBN${isbn}&printsec=frontcover&img=1&zoom=1` : '';
+const rakutenCover=isbn=>isISBN13(isbn)
+  ? `https://thumbnail.image.rakuten.co.jp/@0_mall/book/cabinet/${isbn.slice(-4)}/${isbn}.jpg` : '';
 const coverKnown=new Map(), coverFailed=new Map(), coverUpdates=new Map();
 const coverSrcs=b=>{
   const known=coverKnown.get(b.isbn), first=known&&known.original===(b.cover||'')?known.src:b.cover;
-  return [...new Set([first,b.cover,aCover(b.isbn),gCover(b.isbn)].filter(Boolean))]
+  return [...new Set([first,b.cover,aCover(b.isbn),rakutenCover(b.isbn),gCover(b.isbn)].filter(Boolean))]
     .filter(url=>Date.now()-(coverFailed.get(url)||0)>300000);
 };
 
@@ -1385,15 +1398,15 @@ function nextCover(el){
 // 読み込めても中身が「表紙なし」画像のことがある
 let coverT=0;
 function ckCover(el){
-  if(el.naturalWidth<=1||(el.naturalWidth===128&&el.naturalHeight===170)) return nextCover(el);
+  if(el.naturalWidth<=1||(el.src.startsWith('https://books.google.com/books/content?')&&el.naturalWidth===128&&el.naturalHeight===170)) return nextCover(el);
   /* 表示に成功したURLを本に書き戻す。書かないと、描画のたびに
-     同じ当てずっぽう（Amazon→Google）の失敗をやり直すことになる。
-     検索結果の画像（data-b なし）は棚の本ではないので触らない */
+     同じ候補の失敗をやり直すことになる。
+     検索結果はURLだけ覚え、登録されるまでは棚に書き込まない */
   const isbn=el.dataset.b;
   if(isbn){
     const original=el.dataset.original||'', src=el.src;
     coverKnown.set(isbn,{original,src});
-    if(original===src) return;
+    if(el.dataset.p||original===src) return;
     coverUpdates.set(isbn,{original,src});
     clearTimeout(coverT); coverT=setTimeout(async()=>{
       const updates=new Map(coverUpdates); coverUpdates.clear();
@@ -2046,7 +2059,7 @@ function bulkBar(items,q){
      国会図書館は著者の別作品まで返してくるので（「幼女戦記」で
      同じ作者の「売国機関」が来る）、巻数の多さだけで選ぶと
      頼んでいない作品を丸ごと棚に入れてしまう。 */
-  const qk=q?mkey(q):'';
+  const qk=q?mkey(findTitle(q)):'';
   let best=null, sibs=[];
   byT.forEach((list,t)=>{
     if(!qk||t!==qk) return;
@@ -2615,7 +2628,7 @@ function results(items,grouped,q){
     const k=p.vol?mkey(p.series)+'#'+p.vol:null;
     const dup=k&&seen.has(k); if(k) seen.add(k);
     return `<div class="hit">
-    ${s.length?`<img src="${esc(s[0])}" alt="" loading="lazy" data-p="1"
+    ${s.length?`<img src="${esc(s[0])}" alt="" loading="lazy" data-p="1" data-b="${esc(x.isbn)}" data-original="${esc(x.cover||'')}"
         data-n="${esc(s.slice(1).map(encodeURIComponent).join(' '))}" onload="ckCover(this)" onerror="nextCover(this)">`
        :`<div class="ph"></div>`}
     <div class="n">${esc(x.title)}${dup?'<em class="alt">別版</em>':''}<small>${esc(x.author)}${
@@ -2634,7 +2647,7 @@ function results(items,grouped,q){
   /* 探した題名そのもの → その名前で始まる作品（外伝） → それ以外。
      国会図書館は主題も見るので、「オーバーロード」で
      「過重負担化するカリキュラム」まで返ってくる。同じ並びに混ぜない。 */
-  const qk=q?skey(mainTitle(q)):'';
+  const qk=q?mkey(findTitle(q)):'';
   const score=t=>!qk?1:(t===qk?0:t.indexOf(qk)===0?1:2);
   const arr=[...byT.entries()].map(([t,g],i)=>({t,g,i}))
     .sort((a,b)=>score(a.t)-score(b.t)||a.i-b.i);
@@ -2900,7 +2913,7 @@ async function fillCovers(){
 /* まとめて追加した直後の本は表紙URLを持っていない（国会図書館は書影を返さない）。
    1冊ずつ Amazon を当てずっぽうに引く前に、openBD へ1回だけまとめて聞く。
    描画が起こす表紙取得と同じ種類の通信なので、追加操作の続きとして自動で走らせてよい。
-   失敗しても黙って引き下がる——従来のフォールバック（Amazon→Google）がそのまま働く */
+   通信に失敗しても棚の表示時にISBNから書影を探せる */
 async function fillCoversFor(list){
   const targets=list.filter(b=>isISBN13(b.isbn)&&!b.cover).map(b=>Object.assign({},b));
   if(!targets.length) return;
